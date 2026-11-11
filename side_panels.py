@@ -5,7 +5,9 @@ the devices and puts their streams into the page. Capture runs only while a page
 Nothing here sends input to any device.
 
 - Android (every device `adb devices` reports ready): `adb exec-out screenrecord` (H.264)
-  decoded by ffmpeg into JPEG frames, sent as MJPEG.
+  decoded by ffmpeg into JPEG frames, sent as MJPEG. adb is found like the deck CLI finds it:
+  env ADB, then PATH, then $ANDROID_HOME (or $ANDROID_SDK_ROOT, default ~/Library/Android/sdk)
+  /platform-tools/adb. ffmpeg must be on PATH.
 - Simulators: `simctl io <udid> screenshot` polled (~2 fps), sent as MJPEG.
 """
 import asyncio
@@ -17,6 +19,7 @@ import os
 import re
 import shutil
 import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from PIL import Image
@@ -39,14 +42,39 @@ BOUNDARY = b"frame"
 AUD = b"\x00\x00\x00\x01\x09\xf0"  # H.264 access unit delimiter
 
 
+def adb_path() -> Optional[str]:
+    """adb as the deck CLI finds it: env ADB, PATH, then the Android SDK's platform-tools."""
+    override = os.environ.get("ADB")
+    if override:
+        return override
+    found = shutil.which("adb")
+    if found:
+        return found
+    sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or str(
+        Path.home() / "Library/Android/sdk")
+    cand = Path(sdk) / "platform-tools/adb"
+    return str(cand) if cand.exists() else None
+
+
+async def stop_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill a child and reap it, also while the calling task is being cancelled."""
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(proc.wait(), 2.0)
+
+
 async def run(*args: str, timeout: float = 10.0) -> str:
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError:
-        proc.kill()
+        await stop_process(proc)
         raise RuntimeError(f"{args[0]} timed out") from None
+    except BaseException:
+        await stop_process(proc)
+        raise
     text = out.decode("utf-8", "replace")
     if proc.returncode:
         raise RuntimeError(text.strip() or f"{args[0]} exited {proc.returncode}")
@@ -66,6 +94,7 @@ class Frames:
         self.new_frame = asyncio.Condition()
         self.viewers = 0
         self.error: Optional[str] = None
+        self.closed = False
         self._capture = capture
         self._task: Optional[asyncio.Task[None]] = None
 
@@ -79,6 +108,8 @@ class Frames:
             self.new_frame.notify_all()
 
     def _ensure_capture(self) -> None:
+        if self.closed:
+            return
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run_capture())
 
@@ -97,6 +128,9 @@ class Frames:
                 return
 
     async def stream(self, writer: asyncio.StreamWriter, head: bytes) -> None:
+        """MJPEG to one viewer until it goes away or close() is called."""
+        if self.closed:
+            return
         writer.write(head + b"\r\n--" + BOUNDARY + b"\r\n")
         self.viewers += 1
         self._ensure_capture()
@@ -106,8 +140,11 @@ class Frames:
                 async with self.new_frame:
                     with contextlib.suppress(asyncio.TimeoutError):
                         await asyncio.wait_for(
-                            self.new_frame.wait_for(lambda: self.frame_no != sent), KEEPALIVE_SECS)
+                            self.new_frame.wait_for(lambda: self.frame_no != sent or self.closed),
+                            KEEPALIVE_SECS)
                     frame, sent = self.frame, self.frame_no
+                if self.closed:
+                    return
                 self._ensure_capture()  # in case it was just stopping when this viewer came
                 if frame is None:
                     continue
@@ -120,17 +157,22 @@ class Frames:
             self.viewers -= 1
 
     async def close(self) -> None:
+        """Stop capturing for good and end every viewer's stream."""
+        self.closed = True
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
+        async with self.new_frame:
+            self.new_frame.notify_all()
 
 
 class Android:
     """One adb device or emulator."""
 
-    def __init__(self, serial: str) -> None:
+    def __init__(self, serial: str, adb: str = "adb") -> None:
         self.serial = serial
+        self.adb_exe = adb
         self.size: Optional[tuple[int, int]] = None
         self.name: Optional[str] = None
         self.meta = ""
@@ -138,7 +180,7 @@ class Android:
         self.frames = Frames(self._capture)
 
     async def adb(self, *args: str, timeout: float = 10.0) -> str:
-        return await run("adb", "-s", self.serial, *args, timeout=timeout)
+        return await run(self.adb_exe, "-s", self.serial, *args, timeout=timeout)
 
     async def detect(self) -> None:
         sizes = re.findall(r"(\d+)x(\d+)", await self.adb("shell", "wm", "size"))
@@ -175,23 +217,27 @@ class Android:
         assert self.size is not None
         width, height = self.size
         out_w, out_h = width // 2 & ~1, height // 2 & ~1  # half size is plenty for the panel
-        record = await asyncio.create_subprocess_exec(
-            "adb", "-s", self.serial, "exec-out", "screenrecord", "--output-format=h264",
-            f"--size={out_w}x{out_h}", "--bit-rate=6000000", f"--time-limit={RECORD_LIMIT}", "-",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        # No -fflags nobuffer: it drops the first key frame and screenrecord sends few of them.
-        # -threads 1 on the encoder too, a threaded mjpeg encoder holds frames back.
-        decode = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-flags", "low_delay", "-threads", "1",
-            "-use_wallclock_as_timestamps", "1", "-probesize", "32", "-analyzeduration", "0",
-            "-f", "h264", "-i", "-", "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "-threads", "1",
-            "-flush_packets", "1", "-fps_mode", "passthrough", "-",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        pump = asyncio.create_task(self._pump(record, decode))
-        assert decode.stdout is not None
-        buf = b""
-        idle_since: Optional[float] = None
+        procs: list[asyncio.subprocess.Process] = []
+        pump: Optional[asyncio.Task[None]] = None
         try:
+            record = await asyncio.create_subprocess_exec(
+                self.adb_exe, "-s", self.serial, "exec-out", "screenrecord", "--output-format=h264",
+                f"--size={out_w}x{out_h}", "--bit-rate=6000000", f"--time-limit={RECORD_LIMIT}", "-",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            procs.append(record)
+            # No -fflags nobuffer: it drops the first key frame and screenrecord sends few of them.
+            # -threads 1 on the encoder too, a threaded mjpeg encoder holds frames back.
+            decode = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-flags", "low_delay", "-threads", "1",
+                "-use_wallclock_as_timestamps", "1", "-probesize", "32", "-analyzeduration", "0",
+                "-f", "h264", "-i", "-", "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "-threads", "1",
+                "-flush_packets", "1", "-fps_mode", "passthrough", "-",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            procs.append(decode)
+            pump = asyncio.create_task(self._pump(record, decode))
+            assert decode.stdout is not None
+            buf = b""
+            idle_since: Optional[float] = None
             while True:
                 try:
                     chunk = await asyncio.wait_for(decode.stdout.read(1 << 16), 1.0)
@@ -213,12 +259,10 @@ class Android:
                 elif time.monotonic() - idle_since > IDLE_STOP_SECS:
                     return
         finally:
-            pump.cancel()
-            for proc in (record, decode):
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(proc.wait(), 2.0)
+            if pump is not None:
+                pump.cancel()
+            for proc in procs:
+                await stop_process(proc)
 
     @staticmethod
     async def _pump(record: asyncio.subprocess.Process, decode: asyncio.subprocess.Process) -> None:
@@ -261,7 +305,8 @@ class Android:
 class Androids:
     """Every ready adb device (or only ANDROID_SERIAL), listed on demand."""
 
-    def __init__(self) -> None:
+    def __init__(self, adb: str = "adb") -> None:
+        self.adb = adb
         self.devices: dict[str, Android] = {}
         self._listed_at = 0.0
         self._lock = asyncio.Lock()
@@ -271,14 +316,14 @@ class Androids:
             if time.monotonic() - self._listed_at < ADB_LIST_TTL:
                 return
             self._listed_at = time.monotonic()
-            lines = (await run("adb", "devices")).splitlines()[1:]
+            lines = (await run(self.adb, "devices")).splitlines()[1:]
             ready = [line.split()[0] for line in lines if line.endswith("\tdevice")]
             ready = [s for s in ready if SERIAL_RE.match(s) and (not SERIAL or s == SERIAL)]
             for serial in list(self.devices):
                 if serial not in ready:
                     await self.devices.pop(serial).frames.close()
             for serial in ready:
-                device = self.devices.setdefault(serial, Android(serial))
+                device = self.devices.setdefault(serial, Android(serial, self.adb))
                 if device.name is None:
                     try:
                         await device.detect()
@@ -335,7 +380,12 @@ class Simulators:
         for udid in list(self.frames):
             if udid not in devices:
                 await self.frames.pop(udid).close()
+                self._shot_path(udid).unlink(missing_ok=True)
         self.devices = devices
+
+    @staticmethod
+    def _shot_path(udid: str) -> Path:
+        return config.runtime_dir() / f"sim-{udid}.jpeg"
 
     async def _frame(self, model_id: str) -> Optional[dict[str, Any]]:
         try:
@@ -345,9 +395,9 @@ class Simulators:
             return None
 
     async def _capture(self, udid: str, frames: Frames) -> None:
-        path = config.runtime_dir() / f"sim-{udid}.jpeg"
+        path = self._shot_path(udid)
         try:
-            while not frames.idle():
+            while not frames.idle() and not frames.closed:
                 started = time.monotonic()
                 await run("xcrun", "simctl", "io", udid, "screenshot", "--type=jpeg", str(path), timeout=15.0)
                 jpeg = path.read_bytes()
@@ -358,8 +408,7 @@ class Simulators:
                     await frames.publish(jpeg)
                 await asyncio.sleep(max(0.1, SIM_INTERVAL - (time.monotonic() - started)))
         finally:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+            path.unlink(missing_ok=True)
 
     def info(self) -> list[dict[str, Any]]:
         out = []
@@ -371,13 +420,17 @@ class Simulators:
 
 
 class SidePanels:
-    """The stream server: GET /android/<serial>/stream.mjpg and /sim/<udid>/stream.mjpg only."""
+    """The stream server. GET only: /android/<serial>/ and /sim/<udid>/ followed by stream.mjpg
+    (MJPEG while the client stays) or frame.jpg (the latest frame, 404 before the first one)."""
 
     def __init__(self, bind: str, port: int, page_port: int) -> None:
         self.bind, self.port = bind, port
-        self.page_origins = {f"http://127.0.0.1:{page_port}", f"http://localhost:{page_port}"}
-        self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-        self.androids: Optional[Androids] = Androids() if shutil.which("adb") and shutil.which("ffmpeg") else None
+        host = (f"[{bind}]" if ":" in bind else bind).lower()
+        names = {"127.0.0.1", "localhost", host}
+        self.page_origins = {f"http://{name}:{page_port}" for name in names}
+        self.hosts = {f"{name}:{port}" for name in names}
+        adb = adb_path()
+        self.androids: Optional[Androids] = Androids(adb) if adb and shutil.which("ffmpeg") else None
         self.sims: Optional[Simulators] = Simulators() if shutil.which("xcrun") else None
         self._server: Optional[asyncio.Server] = None
         self._refreshing: dict[int, asyncio.Task[None]] = {}
@@ -385,7 +438,7 @@ class SidePanels:
 
     async def start(self) -> None:
         if self.androids is None:
-            logger.warning("android panels disabled: adb or ffmpeg not on PATH")
+            logger.warning("android panels disabled: adb not found (ADB, PATH, ANDROID_HOME) or ffmpeg not on PATH")
         self._server = await asyncio.start_server(self._client, self.bind, self.port)
         logger.info("android and simulator streams at http://%s:%s/", self.bind, self.port)
 

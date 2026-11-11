@@ -8,13 +8,23 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PMD3="$DIR/venv/bin/pymobiledevice3"
 PY="$DIR/venv/bin/python"
 DEVICE="${DEVICEDECK_UDID:-${PHONE_UDID:-${PHONE_DEVICE:-}}}"
-OUT_DIR="${DEVICEDECK_RUNTIME_DIR:-${PHONE_OUT_DIR:-$HOME/Library/Caches/devicedeck}}"
+expand_home() {
+  case "$1" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s\n' "$HOME/${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+RUNTIME_DIR="$(expand_home "${DEVICEDECK_RUNTIME_DIR:-$HOME/Library/Caches/devicedeck}")"
+SOCK="$(expand_home "${DEVICEDECK_SOCK:-${PHONED_SOCK:-$RUNTIME_DIR/phoned.sock}}")"
+OUT_DIR="$(expand_home "${PHONE_OUT_DIR:-$RUNTIME_DIR}")"
+export DEVICEDECK_RUNTIME_DIR="$RUNTIME_DIR" DEVICEDECK_SOCK="$SOCK"
 PORT="${DEVICEDECK_PORT:-7317}"  # preview page; Android + simulator streams on PORT+1
 URL="http://127.0.0.1:$PORT/"
 
 PHONEC="$DIR/phonec"
-SIZE_FILE="$OUT_DIR/last-shot-size"
-mkdir -p "$OUT_DIR" && chmod 700 "$OUT_DIR"
+SIZE_FILE="$RUNTIME_DIR/last-shot-size"
+mkdir -p "$RUNTIME_DIR" && chmod 700 "$RUNTIME_DIR"
 [ -n "$DEVICE" ] && export DEVICEDECK_UDID="$DEVICE" PYMOBILEDEVICE3_UDID="$DEVICE"
 
 hid() {
@@ -99,8 +109,35 @@ print(p[0], p[1])' 2>/dev/null || echo "")
 }
 
 norm() {
-  local value="$1" size="$2"
-  python3 -c "v=round(float('$value')*65535/float('$size')); print(max(0, min(65535, v)))"
+  python3 -c '
+import sys
+try:
+    v = round(float(sys.argv[1]) * 65535 / float(sys.argv[2]))
+except ValueError:
+    sys.exit("not a number: " + sys.argv[1])
+print(max(0, min(65535, v)))' "$1" "$2"
+}
+
+guard() {
+  device >/dev/null
+  local status=0
+  "$PY" - "$DIR" "$DEVICE" <<'PY' || status=$?
+import sys
+sys.path.insert(0, sys.argv[1])
+import config
+reason = config.input_lock(sys.argv[2], physical=True)
+if reason:
+    why = {"config": 'its config entry has "allowInput" set to something other than true',
+           "config unreadable": f"the config file {config.CONFIG_PATH} cannot be read",
+           "env": "DEVICEDECK_LOCK_PHYSICAL_INPUT=1 locks physical devices"}.get(reason, reason)
+    print(f"refused: input to {sys.argv[2]} is locked because {why}. Only the device owner can unlock it.",
+          file=sys.stderr)
+    sys.exit(3)
+PY
+  if [ "$status" -ne 0 ]; then
+    [ "$status" -eq 3 ] || echo "phone: cannot check the input lock for $DEVICE" >&2
+    exit 3
+  fi
 }
 
 coords() {
@@ -117,8 +154,10 @@ coords() {
   fi
   local result=()
   local i=0
+  local v
   for a in "${args[@]}"; do
-    if [ $((i % 2)) -eq 0 ]; then result+=("$(norm "$a" "$w")"); else result+=("$(norm "$a" "$h")"); fi
+    if [ $((i % 2)) -eq 0 ]; then v="$(norm "$a" "$w")" || exit 1; else v="$(norm "$a" "$h")" || exit 1; fi
+    result+=("$v")
     i=$((i + 1))
   done
   echo "${result[@]}"
@@ -163,20 +202,27 @@ case "$cmd" in
     echo "$file"
     ;;
   tap)
-    read -r x y <<<"$(coords "$@")"
+    guard
+    xy="$(coords "$@")"
+    read -r x y <<<"$xy"
     if daemon_up; then via_daemon tap "$x" "$y"; else hid tap -- "$x" "$y" >/dev/null; fi
     ;;
   drag)
-    read -r x1 y1 x2 y2 <<<"$(coords "$@")"
+    guard
+    xy="$(coords "$@")"
+    read -r x1 y1 x2 y2 <<<"$xy"
     if daemon_up; then via_daemon drag "$x1" "$y1" "$x2" "$y2"; else hid drag -- "$x1" "$y1" "$x2" "$y2" >/dev/null; fi
     ;;
   type)
-    if daemon_up; then via_daemon type "$1"; else hid type "$1" >/dev/null; fi
+    guard
+    if daemon_up; then via_daemon type "$1"; else hid type -- "$1" >/dev/null; fi
     ;;
   key)
+    guard
     if daemon_up; then via_daemon key "$1" "${2:-1}"; else hid key "$1" --count "${2:-1}" >/dev/null; fi
     ;;
   button)
+    guard
     if daemon_up; then
       via_daemon button "$1"
     else
@@ -197,7 +243,7 @@ for e in json.load(sys.stdin):
     print(e.get('caption') or e.get('spoken_description') or '')"
     ;;
   clip)
-    device >/dev/null
+    guard
     printf '%s' "$1" | xcrun devicectl device pasteboard copy --device "$DEVICE" -q
     ;;
   apps)
@@ -205,7 +251,7 @@ for e in json.load(sys.stdin):
     xcrun devicectl device info apps --device "$DEVICE" ${1:+--include-all-apps} 2>/dev/null | sed -n '/^Name/,$p'
     ;;
   launch)
-    device >/dev/null
+    guard
     if [ -n "${2:-}" ]; then
       xcrun devicectl device process launch --device "$DEVICE" --terminate-existing --payload-url "$2" "$1" -q
     else
@@ -213,7 +259,7 @@ for e in json.load(sys.stdin):
     fi
     ;;
   kill)
-    device >/dev/null
+    guard
     apps_json="$(mktemp)"
     procs_json="$(mktemp)"
     xcrun devicectl device info apps --device "$DEVICE" --include-all-apps --bundle-id "$1" --json-output "$apps_json" -q >/dev/null 2>&1
@@ -243,21 +289,21 @@ PY
       echo "phoned is already running, preview at $URL"
       exit 0
     fi
-    nohup "$PY" "$DIR/phoned.py" --preview >"$OUT_DIR/phoned.log" 2>&1 &
+    nohup "$PY" "$DIR/phoned.py" --preview >"$RUNTIME_DIR/phoned.log" 2>&1 &
     for _ in $(seq 1 30); do
       sleep 1
       if daemon_up; then
-        echo "phoned is running, preview at $URL, log $OUT_DIR/phoned.log"
+        echo "phoned is running, preview at $URL, log $RUNTIME_DIR/phoned.log"
         exit 0
       fi
     done
-    echo "phoned did not start, see $OUT_DIR/phoned.log" >&2
+    echo "phoned did not start, see $RUNTIME_DIR/phoned.log" >&2
     exit 1
     ;;
   stop)
     if "$PHONEC" quit >/dev/null 2>&1; then
       for _ in $(seq 1 30); do
-        [ -S "${DEVICEDECK_SOCK:-${PHONED_SOCK:-$OUT_DIR/phoned.sock}}" ] || break
+        [ -S "$SOCK" ] || break
         sleep 1
       done
     fi

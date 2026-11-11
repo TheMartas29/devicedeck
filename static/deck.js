@@ -45,7 +45,6 @@
     let video;
     if (!isImage(d)) {
       video = document.createElement('iframe');
-      video.setAttribute('sandbox', 'allow-scripts allow-same-origin');
       video.setAttribute('tabindex', '-1');
       video.setAttribute('scrolling', 'no');
       video.title = d.name;
@@ -91,6 +90,7 @@
   function updateTile(tile, d, index) {
     tile.el.style.order = String(index);
     if (tile.name.textContent !== d.name) tile.name.textContent = d.name;
+    if (!tile.image && tile.video.title !== d.name) tile.video.title = d.name;
     if (tile.meta.textContent !== (d.meta || '')) tile.meta.textContent = d.meta || '';
     tile.label.setAttribute('aria-label', d.name + (d.meta ? ', ' + d.meta : '') + '. Drag to move.');
     const src = streamUrl(d);
@@ -303,7 +303,7 @@
 
   function renderList(force) {
     if (panel.hidden) return;
-    if (!force && panel.contains(document.activeElement) && document.activeElement.tagName === 'INPUT') return;
+    if (!force && panel.contains(document.activeElement) && document.activeElement.type === 'text') return;
     const sig = JSON.stringify(devices.map((d) => [keyOf(d), d.name, d.custom_name, d.hidden, d.connected, d.meta]));
     if (!force && sig === listSig) return;
     listSig = sig;
