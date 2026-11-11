@@ -3,10 +3,10 @@
     {
       "id": "00008110-0000000000000001",
       "kind": "ios",
-      "name": "Personal iPhone",
+      "name": "My iPhone",
       "hidden": false,
       "order": 0,
-      "allowInput": false
+      "allowInput": true
     },
     {
       "id": "00008120-0000000000000002",
