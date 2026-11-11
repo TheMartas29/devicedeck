@@ -325,7 +325,8 @@ class WDABackend(unittest.TestCase):
 
     def test_launch_and_error_message(self):
         self.assertEqual(self.dev.launch("com.apple.Preferences"), "launched com.apple.Preferences")
-        self.assertIn(("/session/S1/wda/apps/launch", {"bundleId": "com.apple.Preferences"}), self.posts())
+        app = [p for p, b in self.posts() if b == {"bundleId": "com.apple.Preferences"}]
+        self.assertEqual(app, ["/session/S1/wda/apps/terminate", "/session/S1/wda/apps/launch"])
         with self.assertRaises(deck.DeckError) as cm:
             self.dev.launch("com.missing")
         self.assertIn("not installed", str(cm.exception))
@@ -446,6 +447,20 @@ class WDASetup(unittest.TestCase):
     def test_setup_only_for_ios(self):
         sim = FakeSim("SIM", "sim", "iPhone 17", "iOS 27.2", "booted")
         self.assertEqual(call(["sim", "wda-setup"], [sim])[0], 2)
+
+
+class IOSState(unittest.TestCase):
+    def test_idle_tunnel_on_cable_is_connected(self):
+        cp = {"pairingState": "paired", "transportType": "wired", "tunnelState": "disconnected"}
+        self.assertEqual(deck.ios_state(cp), "connected")
+
+    def test_unplugged_device_stays_unavailable(self):
+        self.assertEqual(deck.ios_state({"pairingState": "paired", "tunnelState": "unavailable"}), "unavailable")
+        self.assertEqual(deck.ios_state({"pairingState": "paired", "tunnelState": "disconnected"}), "disconnected")
+
+    def test_connected_tunnel_passes_through(self):
+        cp = {"pairingState": "paired", "transportType": "wired", "tunnelState": "connected"}
+        self.assertEqual(deck.ios_state(cp), "connected")
 
 
 class Config(unittest.TestCase):

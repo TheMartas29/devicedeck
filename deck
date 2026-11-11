@@ -468,7 +468,9 @@ class WDA:
         return lines
 
     def launch(self, bundle: str) -> None:
-        self.http("POST", f"/session/{self.session()}/wda/apps/launch", {"bundleId": bundle})
+        sid = self.session()
+        self.http("POST", f"/session/{sid}/wda/apps/terminate", {"bundleId": bundle})
+        self.http("POST", f"/session/{sid}/wda/apps/launch", {"bundleId": bundle})
 
     def window_size(self) -> tuple[float, float] | None:
         try:
@@ -823,6 +825,14 @@ class IOSDevice(Device):
         return self.wda.stop()
 
 
+def ios_state(cp: dict) -> str:
+    """CoreDevice drops an idle tunnel; a device still attached by cable or network is usable."""
+    state = cp.get("tunnelState") or "unknown"
+    if state == "disconnected" and cp.get("transportType") and cp.get("pairingState") == "paired":
+        return "connected"
+    return state
+
+
 def detect_ios() -> list[Device]:
     if not shutil.which("xcrun"):
         return []
@@ -836,7 +846,7 @@ def detect_ios() -> list[Device]:
         if hw.get("reality") == "simulated" or hw.get("platform") not in ("iOS", "iPadOS"):
             continue
         udid = hw.get("udid") or d.get("identifier")
-        state = cp.get("tunnelState") or "unknown"
+        state = ios_state(cp)
         dev = IOSDevice(udid, dp.get("name") or "", hw.get("marketingName") or hw.get("productType") or "",
                         f"{hw.get('platform', 'iOS')} {dp.get('osVersionNumber', '?')}", state,
                         product_type=hw.get("productType", ""))
