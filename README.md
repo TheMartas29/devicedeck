@@ -128,6 +128,8 @@ On iOS 26 and older the phone rejects remote input from pymobiledevice3 (error 9
 
 After that, every `deck` command on that phone starts the runner and the forward by itself. `deck <dev> wda-stop` stops them. `deck <dev> info` shows which backend a phone uses; `DEVICEDECK_IOS_BACKEND=wda|phoned` (config: `"iosBackend"`) forces one.
 
+These phones have no screen stream either, so the page shows them from screenshots, at about 2 fps. The daemon takes them only while the page is open and sends a new picture only when the screen changed. `deck <dev> shot` works as on any other iPhone.
+
 More settings, each also a config key on the device:
 
 | Variable | Config key | Use |

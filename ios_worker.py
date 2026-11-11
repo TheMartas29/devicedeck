@@ -7,11 +7,14 @@ connected iPhone. A worker listens on two private Unix sockets in the runtime di
   commands to;
 - the HTTP socket of pymobiledevice3's stream server, which phoned's preview page reads the
   video from. phoned passes on only the read-only stream paths, never the input ones.
+  Before iOS 27 the phone has no media stream (error 9021); the socket then serves
+  GET /stream.mjpg instead, built from screenshots taken only while a page watches.
 Run it with the venv's python; phoned does that.
 """
 import argparse
 import asyncio
 import contextlib
+import io
 import json
 import logging
 import os
@@ -22,6 +25,7 @@ from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from PIL import Image
 from pymobiledevice3.exceptions import CoreDeviceError
 from pymobiledevice3.remote.core_device.display_service import (
     MEDIA_IN_USE_MESSAGE,
@@ -60,6 +64,8 @@ from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscove
 from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
 from pymobiledevice3.services.accessibilityaudit import AccessibilityAudit
 
+import side_panels
+
 
 NAMED_KEYS = {
     "backspace": KEY_BACKSPACE,
@@ -83,6 +89,11 @@ READY_TIMEOUT = 20.0
 GIVEN_UP_RESET_SECS = 60.0
 RETRY_START_SECS = 10.0
 PARENT_CHECK_SECS = 2.0
+STREAM_MIN_IOS = 27
+STREAM_UNSUPPORTED = 9021  # CoreDeviceError code: "Remote control requires iOS 27.0 or later"
+SHOT_INTERVAL = 0.5  # shortest time between two preview screenshots (one takes ~1.5 s)
+SHOT_REDUCE = 2
+SHOT_QUALITY = 80
 
 logger = logging.getLogger("ios_worker")
 
@@ -113,6 +124,20 @@ async def _bounded(coro: Awaitable[Any], label: str, timeout: float = 3.0) -> No
         logger.debug("shutdown: %s raised", label, exc_info=True)
 
 
+def _ios_major(version: Optional[str]) -> int:
+    try:
+        return int(str(version).split(".")[0])
+    except ValueError:
+        return STREAM_MIN_IOS
+
+
+def _jpeg(png: bytes) -> bytes:
+    image = Image.open(io.BytesIO(png)).convert("RGB").reduce(SHOT_REDUCE)
+    out = io.BytesIO()
+    image.save(out, "JPEG", quality=SHOT_QUALITY)
+    return out.getvalue()
+
+
 async def _cancel(task: Optional[asyncio.Task[Any]]) -> None:
     if task is None or task.done():
         return
@@ -122,21 +147,32 @@ async def _cancel(task: Optional[asyncio.Task[Any]]) -> None:
 
 
 class Session:
-    def __init__(self, udid: str, http_socket: Path) -> None:
+    def __init__(self, udid: str, http_socket: Path, screenshots: bool = False) -> None:
         self.udid = udid
         self.http_socket = http_socket
+        self.screenshots = screenshots
+        self.stream_unsupported = False
         self.tunnel: Optional[UserspaceRsdTunnel] = None
         self.rsd: Optional[RemoteServiceDiscoveryService] = None
         self.server: Optional[StreamHost] = None
+        self.frames: Optional[side_panels.Frames] = None
+        self.frame_at = 0.0
         self.http: Optional[asyncio.Server] = None
         self._tasks: list[asyncio.Task[Any]] = []
         self._sink: Optional[asyncio.Queue[bytes]] = None
         self._last_start_attempt = 0.0
+        self._shot_lock = asyncio.Lock()
 
     async def open(self) -> None:
         self.tunnel = UserspaceRsdTunnel(serial=self.udid)
         self.rsd = await asyncio.wait_for(self.tunnel.aopen(), timeout=30.0)
         logger.info("tunnel up: %s (iOS %s)", self.rsd.udid, self.rsd.product_version)
+        if self.screenshots or _ios_major(self.rsd.product_version) < STREAM_MIN_IOS:
+            self.screenshots = True
+            self.frames = side_panels.Frames(self._poll)
+            logger.info("no media stream on this phone; the preview polls screenshots")
+            await self._listen(self._serve_frames)
+            return
         server = StreamHost(
             self.rsd,
             bind="127.0.0.1",
@@ -164,11 +200,46 @@ class Session:
             server._rctl_task,
             server._keep_awake_task,
         ]
+        await self._listen(server._handle_http)
+
+    async def _listen(self, handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]) -> None:
         with contextlib.suppress(FileNotFoundError):
             self.http_socket.unlink()
-        self.http = await asyncio.start_unix_server(server._handle_http, path=str(self.http_socket))
+        self.http = await asyncio.start_unix_server(handler, path=str(self.http_socket))
         os.chmod(self.http_socket, 0o600)
         logger.info("stream server on %s", self.http_socket)
+
+    async def screenshot(self) -> bytes:
+        assert self.rsd is not None
+        async with self._shot_lock:
+            async with ScreenCaptureService(self.rsd) as service:
+                return (await service.capture_screenshot())["image"]
+
+    async def _poll(self, frames: side_panels.Frames) -> None:
+        loop = asyncio.get_running_loop()
+        while not frames.idle():
+            started = loop.time()
+            jpeg = await asyncio.to_thread(_jpeg, await self.screenshot())
+            frames.error = None
+            self.frame_at = loop.time()
+            if jpeg != frames.frame:
+                await frames.publish(jpeg)
+            await asyncio.sleep(max(0.05, SHOT_INTERVAL - (loop.time() - started)))
+
+    async def _serve_frames(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        assert self.frames is not None
+        try:
+            request = (await reader.readline()).split()
+            while (await reader.readline()) not in (b"\r\n", b"\n", b""):
+                pass
+            if request[:2] == [b"GET", b"/stream.mjpg"]:
+                await self.frames.stream(writer, side_panels.SidePanels._stream_head(None))
+            else:
+                side_panels.SidePanels._reply(writer, 404, b"not found")
+        except ConnectionError:
+            pass
+        finally:
+            writer.close()
 
     async def _drain_sink(self) -> None:
         assert self._sink is not None
@@ -176,12 +247,13 @@ class Session:
             await self._sink.get()
 
     def dead(self) -> bool:
-        assert self.tunnel is not None and self.server is not None
-        return self.tunnel.rsd is None or self.server._reconnect_signal.is_set()
+        assert self.tunnel is not None
+        return self.tunnel.rsd is None or (self.server is not None and self.server._reconnect_signal.is_set())
 
     async def maintain(self) -> None:
         server = self.server
-        assert server is not None
+        if server is None:
+            return
         now = asyncio.get_running_loop().time()
         if server._consecutive_restarts >= _MAX_STALL_RESTARTS and now - server._last_restart_t > GIVEN_UP_RESET_SECS:
             logger.info("re-arming stall watchdog after %d failed restarts", server._consecutive_restarts)
@@ -191,6 +263,9 @@ class Session:
             try:
                 await asyncio.wait_for(server._ensure_fresh_stream(), timeout=STREAM_RESTART_TIMEOUT)
             except Exception as e:
+                if isinstance(e, CoreDeviceError) and e.code == STREAM_UNSUPPORTED:
+                    self.stream_unsupported = True
+                    return
                 logger.warning("media stream start failed: %s", e)
                 if _is_tunnel_dead_error(e):
                     server._reconnect_signal.set()
@@ -199,6 +274,10 @@ class Session:
         server = self.server
         if self.http is not None:
             self.http.close()
+            if self.frames is not None:
+                self.http.close_clients()
+        if self.frames is not None:
+            await self.frames.close()
         for task in self._tasks:
             await _cancel(task)
         if server is not None:
@@ -271,6 +350,7 @@ class Daemon:
         self.hid_lock = asyncio.Lock()
         self.started_at = time.time()
         self.last_error: Optional[str] = None
+        self.screenshots = False
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -328,7 +408,7 @@ class Daemon:
     async def _supervise(self) -> None:
         delay = 2.0
         while not self.stop.is_set():
-            session = Session(self.udid, self.http_socket)
+            session = Session(self.udid, self.http_socket, self.screenshots)
             opening = asyncio.create_task(session.open())
             stopping = asyncio.create_task(self.stop.wait())
             await asyncio.wait({opening, stopping}, return_when=asyncio.FIRST_COMPLETED)
@@ -366,6 +446,11 @@ class Daemon:
                 self.last_error = "tunnel lost"
                 logger.warning("tunnel lost; reconnecting")
                 return
+            if session.stream_unsupported:
+                logger.info("the phone has no media stream (error %d); reconnecting for screenshots",
+                            STREAM_UNSUPPORTED)
+                self.screenshots = True
+                return
             try:
                 await session.maintain()
             except Exception:
@@ -401,7 +486,8 @@ class Daemon:
             for attempt in range(2):
                 session = await self._session()
                 server = session.server
-                assert server is not None
+                if server is None:
+                    raise CommandError("input needs the media stream (iOS 27 or later)")
                 await self._prepare_stream(server)
                 stream = server._active_service
                 try:
@@ -466,7 +552,8 @@ class Daemon:
         usage_page, usage_code, hold = _NAMED_BUTTONS[name]
         async with self.hid_lock:
             server = (await self._session()).server
-            assert server is not None
+            if server is None:
+                raise CommandError("input needs the media stream (iOS 27 or later)")
             async with server._hid_lock:
                 if server._indigo is None:
                     indigo = IndigoHIDService(server._rsd)
@@ -487,11 +574,7 @@ class Daemon:
                 raise
 
     async def _shot(self, path: Path) -> dict[str, Any]:
-        session = await self._session()
-        assert session.rsd is not None
-        async with ScreenCaptureService(session.rsd) as service:
-            response = await service.capture_screenshot()
-        image: bytes = response["image"]
+        image = await (await self._session()).screenshot()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(image)
         reply: dict[str, Any] = {"path": str(path), "bytes": len(image)}
@@ -513,7 +596,8 @@ class Daemon:
     async def _restart(self) -> None:
         session = await self._session()
         server = session.server
-        assert server is not None
+        if server is None:
+            raise CommandError("no media stream to restart on this phone")
         server._last_restart_t = asyncio.get_running_loop().time()
         await asyncio.wait_for(server._ensure_fresh_stream(force=True), timeout=STREAM_RESTART_TIMEOUT)
 
@@ -529,10 +613,19 @@ class Daemon:
             reply["ios"] = self.product_version
         if self.last_error:
             reply["last_error"] = self.last_error
-        if session is None or session.server is None:
+        if session is None:
+            return reply
+        now = asyncio.get_running_loop().time()
+        if session.frames is not None:
+            reply["preview"] = "screenshots"
+            reply["stream"] = session.frames.frame is not None
+            if session.frame_at:
+                reply["last_frame_age"] = round(now - session.frame_at, 2)
+            reply["viewers"] = session.frames.viewers
+            return reply
+        if session.server is None:
             return reply
         server = session.server
-        now = asyncio.get_running_loop().time()
         streaming = server._active_service is not None
         reply["stream"] = streaming
         if streaming:

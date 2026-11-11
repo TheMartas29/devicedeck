@@ -22,8 +22,10 @@ LOGO_PNG = (importlib.resources.files(pymobiledevice3.resources) / "webinspector
 
 # Paths of the worker's stream server that the viewer may reach, with their method. All read
 # the video; /pli asks the phone for a key frame and /restart restarts the video stream (the
-# viewer's own recovery when frames stop). No input path is here.
-VIEWER_PROXY_PATHS = {("GET", "codec"), ("GET", "stream.bin"), ("POST", "pli"), ("POST", "restart")}
+# viewer's own recovery when frames stop). /stream.mjpg is the screenshot preview of a phone
+# before iOS 27, which the page shows directly. No input path is here.
+VIEWER_PROXY_PATHS = {("GET", "codec"), ("GET", "stream.bin"), ("POST", "pli"), ("POST", "restart"),
+                      ("GET", "stream.mjpg")}
 
 BARE_CSS = """
 html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000 !important}

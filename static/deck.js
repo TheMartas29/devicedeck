@@ -24,6 +24,7 @@
   const tiles = new Map();   // key -> tile
   const keyOf = (d) => d.kind + ':' + d.id;
   const shown = () => devices.filter((d) => d.connected && !d.hidden);
+  const isImage = (d) => d.kind !== 'ios' || /\.mjpg$/.test(d.stream || '');
 
   // ----- tiles
 
@@ -42,7 +43,7 @@
     const screen = document.createElement('div');
     screen.className = 'screen';
     let video;
-    if (d.kind === 'ios') {
+    if (!isImage(d)) {
       video = document.createElement('iframe');
       video.setAttribute('sandbox', 'allow-scripts allow-same-origin');
       video.setAttribute('tabindex', '-1');
@@ -60,8 +61,8 @@
     screen.append(video, off);
     el.append(label, screen);
     const tile = {key: keyOf(d), kind: d.kind, el, label, name, meta, screen, video, off,
-                  frame: null, ratio: null, src: null};
-    if (d.kind !== 'ios') {
+                  frame: null, ratio: null, src: null, image: isImage(d)};
+    if (tile.image) {
       const retry = () => {
         tile.off.hidden = false;
         setTimeout(() => reconnect(tile), 3000);
@@ -96,9 +97,9 @@
     if (src !== tile.src) {
       tile.src = src;
       if (!src) tile.video.removeAttribute('src');
-      else if (d.kind === 'ios') tile.video.src = src;
+      else if (!tile.image) tile.video.src = src;
       else reconnect(tile);
-    } else if (src && d.kind !== 'ios' && !d.live && Date.now() - (tile.kicked || 0) > STALL_MS) {
+    } else if (src && tile.image && !d.live && Date.now() - (tile.kicked || 0) > STALL_MS) {
       reconnect(tile);
     }
     tile.off.hidden = !!d.live;
@@ -142,6 +143,10 @@
     const visible = shown();
     const keys = new Set(visible.map(keyOf));
     for (const tile of [...tiles.values()]) if (!keys.has(tile.key)) removeTile(tile);
+    for (const d of visible) {
+      const tile = tiles.get(keyOf(d));
+      if (tile && tile.image !== isImage(d)) removeTile(tile);
+    }
     visible.forEach((d, i) => updateTile(tiles.get(keyOf(d)) || makeTile(d), d, i));
     empty.hidden = !loaded || visible.length > 0;
     layout();

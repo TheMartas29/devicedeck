@@ -311,10 +311,12 @@ class Hub:
                 error = status.get("last_error") or "connecting…"
             elif not status.get("stream"):
                 error = "waiting for the video stream…"
+            stream = None
+            if worker and worker.running():
+                stream = f"/ios/{udid}/stream.mjpg" if status.get("preview") == "screenshots" else f"/ios/{udid}/"
             out.append({"id": udid, "kind": "ios", "name": info.get("name") or product or udid,
                         "meta": " · ".join(m for m in meta if m), "frame": frame, "size": None,
-                        "live": bool(status.get("stream")), "error": error,
-                        "stream": f"/ios/{udid}/" if worker and worker.running() else None})
+                        "live": bool(status.get("stream")), "error": error, "stream": stream})
         return out
 
     # ----- CLI commands
