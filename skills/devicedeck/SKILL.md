@@ -34,7 +34,7 @@ Done when you hold one unambiguous `<dev>`, its platform, its screen size, and i
 Every action is one turn of the loop: **shot → decide → act → wait → shot**.
 
 1. `deck <dev> shot <file.png>`, then read the PNG.
-2. `deck <dev> elements`. Each line reads `role "label" ="value" #id @x,y [x,y wxh]`, indented to show the tree. `@x,y` is the centre to tap and `[x,y wxh]` the frame, both in tap units. Example: `button "General" #com.apple.settings.general @201,406.3 [16,380.3 370x52]`. The output is long, so filter it, for example `deck <dev> elements | grep '"General"'`. If it returns almost nothing right after a launch, wait a second and run it again. On a simulator or emulator, `elements` alone is enough to find targets between actions; take a screenshot to confirm the result of each screen change. A physical iPhone on iOS 27 and newer (the `phoned` backend; on a physical iPhone, `info` names it) returns captions only, without frames; there, use the captions to confirm what is on screen and measure the target on the screenshot.
+2. `deck <dev> elements`. Each line reads `Role "label" ="value" #id @cx,cy [x,y wxh]`, indented two spaces per tree level (at most 12 spaces). The label is a JSON string; `="value"` appears only when the value differs from the label, `#id` only when there is one. `@cx,cy` is the centre to tap and `[x,y wxh]` the frame, both in tap units and absolute on the screen; numbers are whole or have one decimal. Example: `  Button "General" #com.apple.settings.general @195,406 [16,380 358x52]`. The output is long, so filter it, for example `deck <dev> elements | grep '"General"'`. If it returns almost nothing right after a launch, wait a second and run it again. On a simulator or emulator, `elements` alone is enough to find targets between actions; take a screenshot to confirm the result of each screen change. A physical iPhone on iOS 27 and newer (the `phoned` backend; on a physical iPhone, `info` names it) returns captions only, without frames; there, use the captions to confirm what is on screen and measure the target on the screenshot. A locked physical iPhone on iOS 26 or older refuses `elements` with exit code 3, because it needs WebDriverAgent, which accepts input; work from screenshots there.
 3. Act: one `tap`, `swipe`, `type`, `key` or `launch`.
 4. Wait for the UI to settle: about 1.5 s after a screen change (app launch, navigation, page swipe, Home), less for a single tap in place. A tap sent during an animation is lost.
 5. Take a new screenshot and judge the result from it. The exit code only says the command was delivered.
@@ -56,12 +56,16 @@ Done when the screenshot shows the state the user asked for. When two attempts a
 ## Typing
 
 - `type` sends key presses. On a physical iPhone they follow the phone's hardware-keyboard layout, so on a non-US layout some letters swap (on QWERTZ, y and z). Check the result on a screenshot.
-- Text is ASCII only on Android and on a physical iPhone with the `phoned` backend; the WebDriverAgent backend (iOS 26 and older) also takes Unicode.
+- Text is ASCII only on Android, on iOS simulators and on a physical iPhone with the `phoned` backend; only the WebDriverAgent backend (physical iPhone, iOS 26 and older) also takes Unicode. Non-ASCII text exits 1 before anything is typed.
 - `key` sends named keys and buttons. `home` and `enter` work everywhere; `back` is Android only. `deck --help` lists every name per platform, and an unknown name prints the supported ones.
 
 ## Input lock
 
-Input is allowed on every device by default. The user locks a device with `"allowInput": false` in the config file, or every physical device with `DEVICEDECK_LOCK_PHYSICAL_INPUT=1`. A locked device refuses `tap`, `swipe`, `type`, `key` and `launch` with exit code 3. When that happens, tell the user and wait: unlocking is the user's decision.
+Input is allowed on every device by default. The user locks a device with `"allowInput": false` in the config file, or every physical device with `DEVICEDECK_LOCK_PHYSICAL_INPUT=1`; a config file that does not load locks every device (`deck list` shows `locked (config unreadable)`). A locked device refuses `tap`, `swipe`, `type`, `key`, `launch` and `wda-setup` with exit code 3, and a locked physical iPhone on iOS 26 or older also refuses `elements`. `shot` always works. When a command is refused, tell the user and wait: unlocking is the user's decision. Never edit the config file and never call the phoned socket, `phone` or `phonec` to get around the lock.
+
+## WebDriverAgent (physical iPhone, iOS 26 and older)
+
+`tap`, `swipe`, `type`, `key`, `launch` and `elements` start WebDriverAgent on the phone. While it runs, any local process can send input to the phone through it without authentication. When the task is done, run `deck <dev> wda-stop`.
 
 ## Personal phone rules
 

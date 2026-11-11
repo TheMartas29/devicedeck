@@ -62,8 +62,8 @@ class FakeAndroid(deck.AndroidDevice):
 def fleet():
     phone = FakeIOS("00008101-AAAA", "Owner - iPhone", "iPhone 12 mini", "iOS 27.2", "connected")
     spare = FakeIOS("00008101-BBBB", "spare - iPhone", "iPhone 12", "iOS 26.7", "unavailable")
-    sim = FakeSim("51B9-SIM", "TCMOB-mock", "iPhone 17", "iOS 27.2", "booted")
-    emu = FakeAndroid("emulator-5554", "iw-test", "sdk", "Android 13", "device")
+    sim = FakeSim("ABCD-SIM", "Demo Sim", "iPhone 17", "iOS 27.2", "booted")
+    emu = FakeAndroid("emulator-5554", "pixel-test", "sdk", "Android 13", "device")
     usb = FakeAndroid("R58M123", "Pixel", "Pixel 7", "Android 14", "device", physical=True)
     return [phone, spare, sim, emu, usb]
 
@@ -89,7 +89,7 @@ class Selection(unittest.TestCase):
 
     def test_by_substring(self):
         devs = fleet()
-        self.assertIs(deck.select(devs, "mock"), devs[2])
+        self.assertIs(deck.select(devs, "demo"), devs[2])
 
     def test_ambiguous_substring_exits_2(self):
         with self.assertRaises(deck.DeckError) as cm:
@@ -111,8 +111,8 @@ class Selection(unittest.TestCase):
     def test_hidden_only_affects_the_preview(self):
         devs = fleet()
         devs[2].hidden = True
-        self.assertIs(deck.select(devs, "mock"), devs[2])
-        self.assertIs(deck.select(devs, "51b9-sim"), devs[2])
+        self.assertIs(deck.select(devs, "demo"), devs[2])
+        self.assertIs(deck.select(devs, "abcd-sim"), devs[2])
 
 
 class Guard(unittest.TestCase):
@@ -138,7 +138,7 @@ class Guard(unittest.TestCase):
     def test_config_lock_applies_to_emulator_too(self):
         devs = fleet()
         devs[3].allow_input = False
-        self.assertEqual(call(["iw-test", "tap", "1", "2"], devs)[0], 3)
+        self.assertEqual(call(["pixel-test", "tap", "1", "2"], devs)[0], 3)
         self.assertEqual(devs[3].shell, [])
 
     def test_env_locks_physical_only(self):
@@ -150,8 +150,8 @@ class Guard(unittest.TestCase):
         self.assertEqual(call(["pixel", "tap", "1", "2"], devs, env)[0], 3)
         self.assertEqual(devs[0].calls, [])
         self.assertEqual(devs[4].shell, [])
-        self.assertEqual(call(["mock", "tap", "5", "6"], devs, env)[0], 0)
-        self.assertEqual(call(["iw-test", "tap", "5", "6"], devs, env)[0], 0)
+        self.assertEqual(call(["demo", "tap", "5", "6"], devs, env)[0], 0)
+        self.assertEqual(call(["pixel-test", "tap", "5", "6"], devs, env)[0], 0)
 
     def test_env_other_value_does_not_lock(self):
         devs = fleet()
@@ -161,7 +161,7 @@ class Guard(unittest.TestCase):
         devs = fleet()
         devs[3].allow_input = False
         with mock.patch.object(FakeAndroid, "info", return_value=[("id", "emulator-5554")]):
-            self.assertEqual(call(["iw-test", "info"], devs)[0], 0)
+            self.assertEqual(call(["pixel-test", "info"], devs)[0], 0)
 
     def test_list_input_column(self):
         devs = fleet()
@@ -191,7 +191,7 @@ class Guard(unittest.TestCase):
 
     def test_bad_args_fail_before_device(self):
         devs = fleet()
-        code, _, _ = call(["mock", "tap", "x", "2"], devs)
+        code, _, _ = call(["demo", "tap", "x", "2"], devs)
         self.assertEqual(code, 2)
         self.assertEqual(devs[2].calls, [])
 
@@ -209,6 +209,22 @@ class Android(unittest.TestCase):
     def test_launch_rejects_shell_injection(self):
         with self.assertRaises(deck.DeckError):
             fleet()[3].launch("com.x; reboot")
+
+    def test_launch_quotes_for_device_shell(self):
+        emu = fleet()[3]
+        emu.launch("com.x/.Main$Inner")
+        emu.launch("com.x")
+        self.assertEqual(emu.shell, ["am start -n 'com.x/.Main$Inner'",
+                                     "monkey -p com.x -c android.intent.category.LAUNCHER 1"])
+
+
+class IOSFallback(unittest.TestCase):
+    def test_pmd3_type_ends_options(self):
+        dev = deck.IOSDevice("00008101-TEST", "t", "iPhone", "iOS 27.1", "connected")
+        with mock.patch.object(dev, "sock", return_value=None), mock.patch.object(dev, "pmd3") as pmd3:
+            dev.type_text("-h --x")
+        args = pmd3.call_args[0][0]
+        self.assertEqual(args[-2:], ["--", "-h --x"])
 
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (390).to_bytes(4, "big") + (844).to_bytes(4, "big") + b"rest"
@@ -328,14 +344,50 @@ class WDABackend(unittest.TestCase):
             self.dev.key("back")
         self.assertEqual(cm.exception.code, 2)
 
-    def test_shot_writes_png(self):
+    def no_daemon_no_pmd3(self):
+        return mock.patch.multiple(self.dev, sock=mock.Mock(return_value=None),
+                                   pmd3=mock.Mock(side_effect=deck.DeckError("pymobiledevice3 failed")))
+
+    def test_shot_prefers_phoned_then_pmd3_without_wda(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "s.png"
-            self.dev.shot(path)
+            with mock.patch.object(self.dev, "sock", return_value="/x.sock"), \
+                    mock.patch.object(self.dev, "daemon") as daemon:
+                self.dev.shot(path)
+            daemon.assert_called_once_with("shot " + json.dumps(str(path)))
+            with mock.patch.object(self.dev, "sock", return_value=None), mock.patch.object(self.dev, "pmd3") as pmd3:
+                self.dev.shot(path)
+            self.assertEqual(pmd3.call_args[0][0][:4], ["developer", "core-device", "screen-capture", "screenshot"])
+        self.assertEqual(self.server.calls, [])
+
+    def test_shot_falls_back_to_wda_only_when_unlocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.png"
+            with self.no_daemon_no_pmd3():
+                self.dev.shot(path)
             self.assertEqual(deck.png_size(path), (390, 844))
+            self.server.calls.clear()
+            self.dev.allow_input = False
+            with self.no_daemon_no_pmd3(), self.assertRaises(deck.DeckError) as cm:
+                self.dev.shot(path)
+        self.assertIn("pymobiledevice3 failed", str(cm.exception))
+        self.assertEqual(self.server.calls, [])
+
+    def test_elements_refused_on_locked_device(self):
+        self.dev.allow_input = False
+        code, out, err = call(["test phone", "elements"], [self.dev])
+        self.assertEqual(code, 3)
+        self.assertIn("needs WebDriverAgent", err)
+        self.assertIn("shot", err)
+        self.assertEqual(self.server.calls, [])
+        with mock.patch.dict(os.environ, {"DEVICEDECK_LOCK_PHYSICAL_INPUT": "1"}):
+            self.dev.allow_input = True
+            with self.assertRaises(deck.DeckError) as cm:
+                self.dev.elements()
+        self.assertEqual(cm.exception.code, 3)
 
     def test_cli_shot_prints_points_and_scale(self):
-        with tempfile.TemporaryDirectory() as tmp, \
+        with tempfile.TemporaryDirectory() as tmp, self.no_daemon_no_pmd3(), \
                 mock.patch.object(deck.WDA, "window_size", return_value=(130.0, 281.33)):
             code, out, err = call(["test phone", "shot", str(Path(tmp) / "s.png")], [self.dev])
         self.assertEqual(code, 0, err)
@@ -347,6 +399,23 @@ class WDABackend(unittest.TestCase):
         self.assertIn('  TextField ="Search" @195,822 [28,808 334x28]', lines)
         self.assertFalse(any("hidden" in line for line in lines))
         self.assertTrue(lines[-1].startswith("# physical iOS via WebDriverAgent"))
+
+    def test_elements_widget_children_are_absolute(self):
+        text = {"type": "XCUIElementTypeStaticText", "label": "City", "rect": {"x": 17, "y": 17, "width": 52, "height": 12}}
+        inner = {"type": "XCUIElementTypeOther", "label": "Weather", "rect": {"x": 0, "y": 0, "width": 162, "height": 162},
+                 "children": [{"type": "XCUIElementTypeOther", "rect": {"x": 0, "y": 0, "width": 162, "height": 162},
+                               "children": [text]}]}
+        stack = {"type": "XCUIElementTypeOther", "name": "widget-stack", "rect": {"x": 24, "y": 67, "width": 162, "height": 162},
+                 "children": [{"type": "XCUIElementTypeOther", "rect": {"x": 24, "y": 67, "width": 162, "height": 162},
+                               "children": [inner]}]}
+        app = {"type": "XCUIElementTypeApplication", "rect": {"x": 0, "y": 0, "width": 390, "height": 844},
+               "children": [{"type": "XCUIElementTypeOther", "rect": {"x": 0, "y": 0, "width": 390, "height": 844},
+                             "children": [stack]}]}
+        with mock.patch.object(deck.WDA, "http", return_value={"value": app}), \
+                mock.patch.object(deck.WDA, "ensure"):
+            lines = self.dev.elements()
+        self.assertIn('Other "Weather" @105,148 [24,67 162x162]', [line.strip() for line in lines])
+        self.assertIn('StaticText "City" @67,90 [41,84 52x12]', [line.strip() for line in lines])
 
     def test_launch_and_error_message(self):
         self.assertEqual(self.dev.launch("com.apple.Preferences"), "launched com.apple.Preferences")
@@ -505,10 +574,10 @@ class Config(unittest.TestCase):
             cfg = Path(tmp) / "devices.json"
             cfg.write_text(json.dumps({"devices": [
                 {"id": "emulator-5554", "kind": "android", "name": "Test Pixel", "order": -1},
-                {"id": "51B9-SIM", "kind": "simulator", "hidden": True},
+                {"id": "ABCD-SIM", "kind": "simulator", "hidden": True},
                 {"id": "00008101-AAAA", "kind": "android", "allowInput": False},
-                {"id": "R58M123", "allowInput": False},
-                {"id": "00008101-BBBB", "name": None},
+                {"id": "R58M123", "kind": "android", "allowInput": False},
+                {"id": "00008101-BBBB", "kind": "ios", "name": None},
             ]}))
             devs = fleet()
             with mock.patch.dict(os.environ, {"DEVICEDECK_CONFIG": str(cfg)}), \
@@ -518,10 +587,123 @@ class Config(unittest.TestCase):
                 found = deck.discover()
         self.assertEqual(found[0].name, "Test Pixel")
         self.assertTrue(devs[2].hidden)
-        self.assertTrue(devs[0].allow_input, "kind mismatch must not apply")
+        self.assertFalse(devs[0].allow_input, "allowInput false applies whatever the kind")
+        self.assertEqual(devs[0].name, "Owner - iPhone", "a kind mismatch applies only the lock")
         self.assertFalse(devs[4].allow_input)
         self.assertTrue(devs[1].allow_input, "allowInput defaults to true")
         self.assertEqual(devs[1].name, "spare - iPhone", "name null keeps the detected name")
+
+    def discover_with(self, content):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "devices.json"
+            cfg.write_text(content if isinstance(content, str) else json.dumps(content))
+            devs = fleet()
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"DEVICEDECK_CONFIG": str(cfg)}), \
+                    mock.patch.object(deck, "detect_ios", return_value=devs[:2]), \
+                    mock.patch.object(deck, "detect_sims", return_value=[devs[2]]), \
+                    mock.patch.object(deck, "detect_android", return_value=devs[3:]), redirect_stderr(err):
+                os.environ.pop("DEVICEDECK_LOCK_PHYSICAL_INPUT", None)
+                deck.discover()
+        return devs, err.getvalue()
+
+    def test_lock_matches_id_case_insensitively_and_any_kind(self):
+        devs, err = self.discover_with({"devices": [
+            {"id": "00008101-aaaa", "kind": "iOS", "allowInput": False, "name": "Mine"},
+            {"id": "R58m123", "kind": "ios", "allowInput": "no"},
+            {"id": "EMULATOR-5554", "kind": "android", "allowInput": 0}]})
+        self.assertFalse(devs[0].allow_input)
+        self.assertEqual(devs[0].name, "Mine", "kind matches case-insensitively")
+        self.assertFalse(devs[4].allow_input, "an entry of another kind still locks")
+        self.assertEqual(devs[4].name, "Pixel", "an entry of another kind changes nothing else")
+        self.assertFalse(devs[3].allow_input)
+        self.assertEqual(err, "")
+
+    def test_only_true_words_allow(self):
+        for value in (False, "false", "no", "off", "0", 0, None, "maybe", 2, 1.0, ""):
+            devs, _ = self.discover_with({"devices": [{"id": "R58M123", "kind": "android", "allowInput": value}]})
+            self.assertEqual(devs[4].lock_reason, "config", value)
+        for value in (True, "true", " TRUE ", "yes", "on", "1", 1):
+            devs, err = self.discover_with({"devices": [{"id": "R58M123", "kind": "android", "allowInput": value}]})
+            self.assertIsNone(devs[4].lock_reason, value)
+            self.assertEqual(err, "")
+        devs, err = self.discover_with({"devices": [{"id": "R58M123", "kind": "android", "allowInput": "maybe"}]})
+        self.assertIn("allowInput 'maybe'", err)
+        devs, _ = self.discover_with({"devices": [{"id": "R58M123", "kind": "android"}]})
+        self.assertIsNone(devs[4].lock_reason, "no allowInput key allows")
+
+    def test_bad_fields_lock_every_device_without_crash(self):
+        devs, err = self.discover_with({"devices": [
+            {"id": "emulator-5554", "kind": "android", "order": "first", "hidden": "perhaps", "name": 5},
+            {"id": "R58M123", "kind": "phone"}, "not an entry", {"kind": "ios"}]})
+        self.assertEqual(devs[3].order, 0)
+        self.assertFalse(devs[3].hidden)
+        self.assertEqual(devs[3].name, "pixel-test")
+        for text in ("order 'first'", "hidden 'perhaps'", "name 5", "unknown kind 'phone'", "device 2", "device 3",
+                     "does not load", "locked until it is fixed"):
+            self.assertIn(text, err)
+        self.assertEqual({d.lock_reason for d in devs}, {"config unreadable"})
+
+    def test_unusable_file_locks_every_device(self):
+        for content in ("{not json", json.dumps([{"id": "R58M123"}]), json.dumps({"devices": {"a": 1}}),
+                        json.dumps({}), json.dumps({"devices": [{"id": "R58M123", "allowInput": True}]})):
+            devs, err = self.discover_with(content)
+            self.assertIn("locked until it is fixed", err, content)
+            self.assertEqual({d.lock_reason for d in devs}, {"config unreadable"}, content)
+            for selector in ("pixel", "pixel-test", "demo"):
+                code, _, cerr = call([selector, "tap", "1", "2"], devs)
+                self.assertEqual(code, 3, (content, selector))
+                self.assertIn("config file does not load", cerr)
+            self.assertEqual(devs[0].input_text(), "locked (config unreadable: the config file does not load)")
+            self.assertTrue(deck.table(devs).splitlines()[1].endswith("locked (config unreadable)"))
+
+    def test_empty_device_list_is_fine(self):
+        devs, err = self.discover_with({"devices": []})
+        self.assertEqual(err, "")
+        self.assertTrue(all(d.input_allowed for d in devs))
+
+    def test_same_answer_as_config_input_lock(self):
+        shared = deck.shared_config()
+        cases = [{"devices": [{"id": "00008101-aaaa", "kind": "android", "allowInput": "off"},
+                              {"id": "emulator-5554", "kind": "android", "allowInput": None}]},
+                 {"devices": [{"id": "R58M123", "kind": "android", "allowInput": "yes"}]}, "[", {}]
+        for case in cases:
+            for env in ({}, {"DEVICEDECK_LOCK_PHYSICAL_INPUT": " 1"}):
+                devs, _ = self.discover_with(case)
+                with tempfile.TemporaryDirectory() as tmp:
+                    cfg = Path(tmp) / "devices.json"
+                    cfg.write_text(case if isinstance(case, str) else json.dumps(case))
+                    with mock.patch.object(shared, "CONFIG_PATH", cfg), mock.patch.dict(os.environ, env):
+                        os.environ.pop("DEVICEDECK_LOCK_PHYSICAL_INPUT", None) if not env else None
+                        want = [shared.input_lock(d.id, d.physical) for d in devs]
+                        got = [d.lock_reason for d in devs]
+                self.assertEqual(got, want, (case, env))
+
+
+class Args(unittest.TestCase):
+    def test_non_finite_numbers_are_usage_errors(self):
+        devs = fleet()
+        for argv in (["demo", "tap", "nan", "1"], ["demo", "tap", "1", "inf"], ["demo", "tap", "-Infinity", "1"],
+                     ["demo", "swipe", "1", "2", "3", "4", "nan"], ["demo", "swipe", "NaN", "2", "3", "4"]):
+            code, _, err = call(argv, devs)
+            self.assertEqual(code, 2, argv)
+            self.assertIn("must be a number", err)
+        self.assertEqual(devs[2].calls, [])
+
+    def test_list_rejects_all(self):
+        self.assertEqual(call(["list", "--all"], fleet())[0], 2)
+
+    def test_help_lists_android_search_key(self):
+        self.assertIn("app-switch search", deck.USAGE)
+
+    def test_sock_env_is_tilde_expanded(self):
+        with tempfile.TemporaryDirectory(dir=Path.home()) as tmp:
+            sock = Path(tmp) / "p.sock"
+            sock.touch()
+            short = "~/" + str(sock.relative_to(Path.home()))
+            with mock.patch.dict(os.environ, {"DEVICEDECK_SOCK": short, "PHONED_SOCK": "",
+                                              "DEVICEDECK_RUNTIME_DIR": tmp}):
+                self.assertEqual(deck.phoned_sockets(), [str(sock)])
 
 
 if __name__ == "__main__":

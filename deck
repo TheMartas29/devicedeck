@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import json
+import math
 import os
 import re
 import shlex
@@ -48,13 +49,15 @@ device name, or omitted when exactly one device is connected. An ambiguous
 
 commands:
   list                         devices: id, kind (ios|simulator|android), name, model, os, state, input
-                               (locked (config) / locked (env): see safety below)
+                               (locked (config) / locked (config unreadable) / locked (env): see safety below)
                                (hidden) = hidden in the preview only; deck still controls it
                                --json for machines
   shot <file.png>              screenshot; prints the path, the pixel size and, on iOS, the
                                point size and scale (1170x2532 px = 390x844 pt @3x)
   elements                     accessibility / UI tree as compact text
-                               (centre point to tap, then [x,y wxh] frame, in tap units)
+                               (centre point to tap, then [x,y wxh] frame, in tap units);
+                               refused (exit 3) on a locked iPhone on iOS 26 or older, because it
+                               needs WebDriverAgent, which accepts input: use shot there
   tap <x> <y>                  points on iOS and simulators, pixels on Android
   swipe <x1> <y1> <x2> <y2> [ms]
   type <text>                  ASCII text into the focused field (WDA also takes Unicode)
@@ -63,7 +66,7 @@ commands:
                                ios (WDA): home lock volume-up volume-down enter backspace tab escape
                                simulator: home lock side siri apple-pay enter
                                android:   home back enter backspace tab escape up down left right
-                                          menu power volume-up volume-down app-switch,
+                                          menu power volume-up volume-down app-switch search,
                                           or any KEYCODE_* name or number
   launch <bundle id | package> Android also accepts package/activity
   apps [--all]                 installed apps: bundle id / package, name, version
@@ -78,15 +81,22 @@ physical iPhone backends (chosen per device, override with DEVICEDECK_IOS_BACKEN
 or "iosBackend" in the config):
   phoned  iOS 27 and newer: the phoned daemon (CoreDevice HID, DVT accessibility)
   wda     iOS 26 and older: WebDriverAgent over a USB port forward. Run deck <dev> wda-setup
-          once; later commands start the runner and the forward by themselves.
-          elements then prints frames in points, like the simulator.
+          once; later input and elements commands start the runner and the forward by
+          themselves. elements then prints frames in points, like the simulator. shot does
+          not need WebDriverAgent (phoned, else pymobiledevice3). While it runs, WebDriverAgent
+          accepts input from any local process on 127.0.0.1 without authentication; stop it
+          with deck <dev> wda-stop.
 
 safety (personal phones):
   Input commands (tap swipe type key launch) are allowed on every device by default.
   Lock a personal phone with "allowInput": false in its config entry: input to it
-  then exits 3. DEVICEDECK_LOCK_PHYSICAL_INPUT=1 locks every physical device.
+  then exits 3. Any allowInput other than true, 1, "true", "yes", "on" or "1" locks;
+  the id matches case-insensitively, whatever the entry's kind.
+  DEVICEDECK_LOCK_PHYSICAL_INPUT=1 locks every physical device. A config file that
+  exists but does not load locks every device (locked (config unreadable)) until it
+  is fixed. The phoned socket enforces the same lock for phone and phonec.
 
-config: $DEVICEDECK_CONFIG, default ~/.config/devicedeck/devices.json
+config: $DEVICEDECK_CONFIG, default $XDG_CONFIG_HOME/devicedeck/devices.json (~/.config/...)
   {"devices":[{"id":"<udid or serial>","kind":"ios|simulator|android",
                "name":"display name or null","hidden":false,"order":0,"allowInput":true}]}
   physical iPhones may also set: iosBackend, wdaTeam, wdaBundleId, wdaProject, wdaXctestrun, wdaUrl, wdaPort
@@ -105,6 +115,7 @@ environment:
   DEVICEDECK_WDA_XCTESTRUN        prebuilt .xctestrun to run instead of the wda-setup build (config: wdaXctestrun)
   DEVICEDECK_WDA_URL              use a WebDriverAgent you run yourself; deck starts nothing (config: wdaUrl)
   DEVICEDECK_WDA_PORT             local port of the forward (config: wdaPort; default derived from the UDID)
+  DEVICEDECK_WDA_TIMEOUT          seconds to wait for WebDriverAgent to start, default 120
   ADB, ROCKETSIM, PYMOBILEDEVICE3 override the tool paths
 
 exit codes: 0 ok, 1 command failed, 2 usage / no or ambiguous device, 3 input to a locked device refused
@@ -153,9 +164,12 @@ def png_size(path: Path) -> tuple[int, int] | None:
 
 def num(value: str, what: str) -> float:
     try:
-        return float(value)
+        result = float(value)
     except ValueError:
-        raise DeckError(f"{what} must be a number, got {value!r}", EXIT_USAGE) from None
+        result = math.nan
+    if not math.isfinite(result):
+        raise DeckError(f"{what} must be a number, got {value!r}", EXIT_USAGE)
+    return result
 
 
 def fmt(v: float) -> str:
@@ -182,17 +196,88 @@ def which(env_name: str, *candidates: str) -> str | None:
 # ---------------------------------------------------------------- config
 
 
-def load_config() -> dict[str, dict]:
-    default = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "devicedeck" / "devices.json"
-    path = Path(os.environ.get("DEVICEDECK_CONFIG") or default).expanduser()
+KINDS = ("ios", "simulator", "android")
+TRUE_WORDS, FALSE_WORDS = {"true", "yes", "on", "1"}, {"false", "no", "off", "0"}
+
+
+def warn(message: str) -> None:
+    print(f"deck: {message}", file=sys.stderr)
+
+
+def flag(value) -> bool | None:
+    """True or False for booleans, 0/1 and true/false/yes/no/on/off (any case); None otherwise."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in TRUE_WORDS:
+            return True
+        if word in FALSE_WORDS:
+            return False
+    return None
+
+
+def config_path() -> Path:
+    default = Path(os.environ.get("XDG_CONFIG_HOME") or "~/.config") / "devicedeck" / "devices.json"
+    return Path(os.environ.get("DEVICEDECK_CONFIG") or default).expanduser()
+
+
+def shared_config():
+    """config.py next to deck: the input lock that phoned also enforces, read from the same file."""
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    import config as shared
+    return shared
+
+
+def config_entry(i: int, d: dict, label: str) -> dict:
+    """Display fields of one device entry; bad values warn and fall back. The lock is input_lock's."""
+    kind = d.get("kind")
+    if kind is not None and str(kind).strip().lower() not in KINDS:
+        warn(f"{label}: unknown kind {kind!r} (expected {', '.join(KINDS)}); only its allowInput is used")
+    if "allowInput" in d and flag(d["allowInput"]) is None:
+        warn(f"{label}: allowInput {d['allowInput']!r} is not true or false; input to it is locked")
+    hidden = False if d.get("hidden") is None else flag(d["hidden"])
+    if hidden is None:
+        warn(f"{label}: hidden {d.get('hidden')!r} is not true or false; ignored")
+        hidden = False
+    order = d.get("order") or 0
+    try:
+        if isinstance(order, bool):
+            raise ValueError
+        order = float(order)
+        if not math.isfinite(order):
+            raise ValueError
+    except (TypeError, ValueError):
+        warn(f"{label}: order {d.get('order')!r} is not a number; using 0")
+        order = 0.0
+    name = d.get("name")
+    if name is not None and not isinstance(name, str):
+        warn(f"{label}: name {name!r} is not a string; ignored")
+        name = None
+    return {"raw": d, "kind": str(kind).strip().lower() if kind is not None else None,
+            "hidden": hidden, "order": order, "name": name}
+
+
+def load_config() -> dict[str, list[dict]]:
+    """Display entries by case-folded id; a file that does not parse gives none (and locks, see input_lock)."""
+    path = config_path()
     if not path.exists():
         return {}
     try:
         data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"deck: ignoring config {path}: {e}", file=sys.stderr)
+    except (OSError, ValueError):
         return {}
-    return {str(d["id"]): d for d in data.get("devices", []) if isinstance(d, dict) and d.get("id")}
+    devices = data.get("devices") if isinstance(data, dict) else None
+    entries: dict[str, list[dict]] = {}
+    for i, d in enumerate(devices if isinstance(devices, list) else []):
+        if not isinstance(d, dict) or not isinstance(d.get("id"), str) or not d["id"].strip():
+            warn(f"config {path} device {i}: no usable id; ignored")
+            continue
+        entries.setdefault(d["id"].strip().casefold(), []).append(config_entry(i, d, f"config {path} device {i}"))
+    return entries
 
 
 # ---------------------------------------------------------------- device model
@@ -207,6 +292,7 @@ class Device:
         self.hidden = False
         self.order = 0
         self.allow_input = True
+        self.config_error = False
         self.config: dict = {}
 
     @property
@@ -215,10 +301,13 @@ class Device:
 
     @property
     def lock_reason(self) -> str | None:
-        """None when input is allowed, else "config" ("allowInput": false) or "env" (DEVICEDECK_LOCK_PHYSICAL_INPUT)."""
+        """None when input is allowed, else "config unreadable" (the config file does not load),
+        "config" ("allowInput" not true) or "env" (DEVICEDECK_LOCK_PHYSICAL_INPUT=1), as config.input_lock."""
+        if self.config_error:
+            return "config unreadable"
         if not self.allow_input:
             return "config"
-        if self.physical and os.environ.get("DEVICEDECK_LOCK_PHYSICAL_INPUT") == "1":
+        if self.physical and os.environ.get("DEVICEDECK_LOCK_PHYSICAL_INPUT", "").strip() == "1":
             return "env"
         return None
 
@@ -228,7 +317,13 @@ class Device:
 
     def input_text(self) -> str:
         return {None: "allowed", "config": 'locked (config: "allowInput": false)',
+                "config unreadable": "locked (config unreadable: the config file does not load)",
                 "env": "locked (env: DEVICEDECK_LOCK_PHYSICAL_INPUT=1)"}[self.lock_reason]
+
+    def lock_why(self) -> str:
+        return {"config": "its config entry has \"allowInput\" set to something other than true",
+                "config unreadable": "the config file does not load (see the warning above)",
+                "env": "DEVICEDECK_LOCK_PHYSICAL_INPUT=1 locks physical devices"}.get(self.lock_reason or "", "")
 
     def as_dict(self) -> dict:
         return {"id": self.id, "kind": self.kind, "name": self.name, "model": self.model, "os": self.os,
@@ -298,13 +393,9 @@ def ios_info_lines(dev: Device, display: dict | None) -> list[tuple[str, str]]:
 
 
 def phoned_sockets() -> list[str]:
-    seen: list[str] = []
-    candidates = [os.environ.get("DEVICEDECK_SOCK", ""), os.environ.get("PHONED_SOCK", ""),
-                  str(runtime_dir() / "phoned.sock")]
-    for c in candidates:
-        if c and c not in seen and os.path.exists(c):
-            seen.append(c)
-    return seen
+    path = os.path.expanduser(os.environ.get("DEVICEDECK_SOCK") or os.environ.get("PHONED_SOCK")
+                              or str(runtime_dir() / "phoned.sock"))
+    return [path] if os.path.exists(path) else []
 
 
 def phoned_call(sock_path: str, line: str, timeout: float = 120) -> dict:
@@ -354,6 +445,17 @@ WDA_TRUST_STEPS = """On the iPhone:
   3. Keep the phone unlocked while WebDriverAgent starts."""
 WDA_UNTRUSTED = re.compile(r"not (been )?trusted|untrusted developer|invalid code signature|"
                            r"profile has not been explicitly trusted|Unable to launch .*WebDriverAgentRunner", re.I)
+
+
+def child_origin(x: float, y: float, w: float, h: float, child: dict, ox: float, oy: float) -> tuple[float, float]:
+    """Offset to add to a WDA child's rect. Content hosted by another process (home screen widgets)
+    restarts at 0,0: a child at 0,0 with its parent's size, under a parent placed elsewhere, opens
+    a coordinate space whose origin is the parent's screen position."""
+    r = child.get("rect") or {}
+    if (x or y) and not (r.get("x") or r.get("y")) \
+            and abs(float(r.get("width") or 0) - w) < 1 and abs(float(r.get("height") or 0) - h) < 1:
+        return x + ox, y + oy
+    return ox, oy
 
 
 class WDA:
@@ -467,18 +569,20 @@ class WDA:
         tree = self.http("GET", "/source?format=json", timeout=120).get("value") or {}
         lines: list[str] = []
 
-        def walk(node: dict, depth: int) -> None:
+        def walk(node: dict, depth: int, ox: float, oy: float) -> None:
             r = node.get("rect") or {}
             label, name, value = node.get("label"), node.get("name"), node.get("value")
+            x, y = float(r.get("x") or 0), float(r.get("y") or 0)
             w, h = float(r.get("width") or 0), float(r.get("height") or 0)
             if (label or value or name) and w > 0 and h > 0 and node.get("isVisible") not in (False, "0"):
                 role = str(node.get("type", "?")).replace("XCUIElementType", "")
                 lines.append(element_line(role, label or name, value, name if name and name != label else None,
-                                          float(r.get("x") or 0), float(r.get("y") or 0), w, h, depth))
+                                          x + ox, y + oy, w, h, depth))
             for child in node.get("children") or []:
-                walk(child, depth + 1)
+                cx, cy = child_origin(x, y, w, h, child, ox, oy)
+                walk(child, depth + 1, cx, cy)
 
-        walk(tree, 0)
+        walk(tree, 0, 0.0, 0.0)
         return lines
 
     def launch(self, bundle: str) -> None:
@@ -728,16 +832,40 @@ class IOSDevice(Device):
                 max(0, min(self.HID_MAX, round(y * self.HID_MAX / h))))
 
     def shot(self, path: Path) -> str:
-        if self.backend() == "wda":
-            self.wda.shot(path)
-        elif self.sock():
-            self.daemon("shot " + json.dumps(str(path)))
-        else:
-            self.pmd3(["developer", "core-device", "screen-capture", "screenshot", "--userspace", str(path)])
+        if self.backend() != "wda":
+            if self.sock():
+                self.daemon("shot " + json.dumps(str(path)))
+            else:
+                self.pmd3_shot(path)
+            return "points = pixels / scale (deck info)"
+        errors = []
+        for source in (self.daemon_shot, self.pmd3_shot):
+            try:
+                if source(path) is not False:
+                    return "points = pixels / scale (deck info)"
+            except DeckError as e:
+                errors.append(str(e))
+        if not self.input_allowed:
+            raise DeckError("screenshot failed without WebDriverAgent, and WebDriverAgent is not started on a "
+                            "locked device:\n  " + "\n  ".join(errors))
+        self.wda.shot(path)
         return "points = pixels / scale (deck info)"
+
+    def daemon_shot(self, path: Path) -> bool:
+        if not self.sock():
+            return False
+        self.daemon("shot " + json.dumps(str(path)))
+        return True
+
+    def pmd3_shot(self, path: Path) -> None:
+        self.pmd3(["developer", "core-device", "screen-capture", "screenshot", "--userspace", str(path)])
 
     def elements(self) -> list[str]:
         if self.backend() == "wda":
+            if not self.input_allowed:
+                raise DeckError(f"refused: elements on {self.name} ({self.id}) needs WebDriverAgent, which accepts "
+                                f"input, and input to this device is locked because {self.lock_why()}. "
+                                f"Use deck {self.id} shot <file.png> and read the screenshot instead.", EXIT_GUARD)
             return self.wda.elements() + ["# physical iOS via WebDriverAgent; coordinates in points"]
         if self.sock():
             items = self.daemon("elements", timeout=100).get("captions") or []
@@ -780,7 +908,7 @@ class IOSDevice(Device):
         if self.sock():
             self.daemon("type " + json.dumps(text))
         else:
-            self.pmd3(["developer", "core-device", "universal-hid-service", "type", "--userspace", text])
+            self.pmd3(["developer", "core-device", "universal-hid-service", "type", "--userspace", "--", text])
         return f"typed {len(text)} characters (hardware keyboard: the phone's keyboard layout applies)"
 
     def key(self, name: str) -> str:
@@ -834,7 +962,9 @@ class IOSDevice(Device):
 
     def point_size(self) -> tuple[float, float] | None:
         if self.backend() == "wda":
-            return self.wda.window_size()
+            size = self.wda.window_size()
+            if size:
+                return size
         try:
             return self.points()
         except DeckError:
@@ -1060,9 +1190,9 @@ class AndroidDevice(Device):
         if not re.fullmatch(r"[\w.]+(/[\w.$]+)?", target):
             raise DeckError(f"not a package or package/activity: {target!r}", EXIT_USAGE)
         if "/" in target:
-            out = self.sh(f"am start -n {target}")
+            out = self.sh(f"am start -n {shlex.quote(target)}")
         else:
-            out = self.sh(f"monkey -p {target} -c android.intent.category.LAUNCHER 1")
+            out = self.sh(f"monkey -p {shlex.quote(target)} -c android.intent.category.LAUNCHER 1")
         if "Error" in out or "No activities found" in out or "aborted" in out:
             raise DeckError(out.strip())
         return f"launched {target}"
@@ -1156,15 +1286,26 @@ def discover() -> list[Device]:
         futures = [pool.submit(f) for f in (detect_ios, detect_sims, detect_android)]
         devices = [d for f in futures for d in f.result()]
     config = load_config()
+    shared = shared_config()
+    saved, shared.CONFIG_PATH = shared.CONFIG_PATH, config_path()
+    try:
+        problem = shared.config_error()
+        reasons = {d.id: shared.input_lock(d.id, d.physical) for d in devices}
+    finally:
+        shared.CONFIG_PATH = saved
+    if problem:
+        warn(f"{problem}; input to every device is locked until it is fixed")
     for d in devices:
-        c = config.get(d.id)
-        if c and c.get("kind") in (None, d.kind):
-            if c.get("name"):
-                d.name = str(c["name"])
-            d.hidden = bool(c.get("hidden", False))
-            d.order = int(c.get("order") or 0)
-            d.allow_input = c.get("allowInput") is not False
-            d.config = c
+        d.config_error = reasons[d.id] == "config unreadable"
+        d.allow_input = reasons[d.id] != "config"
+        entries = config.get(d.id.strip().casefold(), [])
+        c = next((e for e in entries if e["kind"] in (None, d.kind)), None)
+        if c:
+            if c["name"]:
+                d.name = c["name"]
+            d.hidden = c["hidden"]
+            d.order = c["order"]
+            d.config = c["raw"]
     devices.sort(key=lambda d: (d.order, KIND_RANK.get(d.kind, 9), not d.usable, d.name.lower()))
     return devices
 
@@ -1218,8 +1359,8 @@ def main(argv: list[str]) -> int:
         return 0 if argv else EXIT_USAGE
     if argv[0] == "list":
         flags = set(argv[1:])
-        if flags - {"--all", "--json"}:
-            raise DeckError(f"unknown option for list: {' '.join(sorted(flags - {'--all', '--json'}))}", EXIT_USAGE)
+        if flags - {"--json"}:
+            raise DeckError(f"unknown option for list: {' '.join(sorted(flags - {'--json'}))}", EXIT_USAGE)
         devices = discover()
         if "--json" in flags:
             print(json.dumps([d.as_dict() for d in devices], indent=2, ensure_ascii=False))
@@ -1269,9 +1410,7 @@ def main(argv: list[str]) -> int:
     if not dev.usable and cmd != "wda-stop":
         raise DeckError(f"{dev.name} ({dev.id}) is {dev.state}, not connected")
     if cmd in GUARDED_COMMANDS and not dev.input_allowed:
-        why = ("its config entry has \"allowInput\": false" if dev.lock_reason == "config"
-               else "DEVICEDECK_LOCK_PHYSICAL_INPUT=1 locks physical devices")
-        raise DeckError(f"refused: input to {dev.name} ({dev.id}) is locked because {why}. "
+        raise DeckError(f"refused: input to {dev.name} ({dev.id}) is locked because {dev.lock_why()}. "
                         f"Only the device owner can unlock it.", EXIT_GUARD)
 
     if cmd == "shot":
