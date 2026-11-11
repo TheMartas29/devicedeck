@@ -12,7 +12,11 @@ deck list [--json]
 deck [<dev>] shot <file.png> | elements | tap x y | swipe x1 y1 x2 y2 [ms] | type <text> | key <name> | launch <id> | apps [--all] | info
 ```
 
-`<dev>` is a device id, a case-insensitive substring of its name, or nothing when exactly one device is connected. `deck --help` is the full reference.
+`<dev>` is a device id, a case-insensitive substring of its name, or nothing when exactly one device is connected. When a physical phone is connected, address other devices by id so a name substring cannot match the phone. `deck --help` is the full reference.
+
+`apps` lists user apps only; system apps such as Settings need `apps --all`. Settings is `com.apple.Preferences` on iOS and `com.android.settings` on Android.
+
+STATE in `deck list`: `connected` (physical iPhone), `booted` (simulator) and `device` (Android) are usable; `unavailable` means paired but not reachable now.
 
 Exit codes: `0` ok, `1` command failed, `2` usage error or no or ambiguous device (the candidates are printed), `3` input refused because the device is locked.
 
@@ -20,8 +24,8 @@ Exit codes: `0` ok, `1` command failed, `2` usage error or no or ambiguous devic
 
 1. Run `deck list`. Choose the device the user named. When several match and the user named none, ask.
 2. Run `deck <dev> info` and note the platform, the screen size in points and pixels, and the scale.
-3. Decide whether it is a **personal phone**: a physical device that the user did not call a test device, or any device whose INPUT column in `deck list` shows it locked. When unsure, treat it as personal.
-4. Send the user the preview URL so they can watch and take over.
+3. Decide whether it is a **personal phone**: a physical device that the user did not call a test device, or any device whose INPUT column in `deck list` shows it locked. When unsure, treat it as personal. Simulators and emulators are never personal phones. A device name containing "test" does not by itself make it a test device.
+4. Send the user the preview URL so they can watch and take over. If you are a subagent, put the URL in your report instead.
 
 Done when you hold one unambiguous `<dev>`, its platform, its screen size, and its personal-phone status.
 
@@ -30,7 +34,7 @@ Done when you hold one unambiguous `<dev>`, its platform, its screen size, and i
 Every action is one turn of the loop: **shot → decide → act → wait → shot**.
 
 1. `deck <dev> shot <file.png>`, then read the PNG.
-2. `deck <dev> elements`. Each line starts with the centre point to tap, then the `[x,y wxh]` frame, both in tap units: tap that centre. A physical iPhone on iOS 27 and newer (the `phoned` backend; `info` names the backend) returns captions only, without frames; there, use the captions to confirm what is on screen and measure the target on the screenshot.
+2. `deck <dev> elements`. Each line reads `role "label" ="value" #id @x,y [x,y wxh]`, indented to show the tree. `@x,y` is the centre to tap and `[x,y wxh]` the frame, both in tap units. Example: `button "General" #com.apple.settings.general @201,406.3 [16,380.3 370x52]`. The output is long, so filter it, for example `deck <dev> elements | grep '"General"'`. If it returns almost nothing right after a launch, wait a second and run it again. On a simulator or emulator, `elements` alone is enough to find targets between actions; take a screenshot to confirm the result of each screen change. A physical iPhone on iOS 27 and newer (the `phoned` backend; on a physical iPhone, `info` names it) returns captions only, without frames; there, use the captions to confirm what is on screen and measure the target on the screenshot.
 3. Act: one `tap`, `swipe`, `type`, `key` or `launch`.
 4. Wait for the UI to settle: about 1.5 s after a screen change (app launch, navigation, page swipe, Home), less for a single tap in place. A tap sent during an animation is lost.
 5. Take a new screenshot and judge the result from it. The exit code only says the command was delivered.
@@ -47,12 +51,13 @@ Done when the screenshot shows the state the user asked for. When two attempts a
 
 - The image you read can be downscaled. Convert by ratio: `x = x_img / width_img * screen_width`, the same for y, where `screen_width` is in the tap unit from `deck <dev> info`.
 - Points and frames from `elements` are already in the tap unit.
+- On Android, `info` also prints a `dp` size; it is informational only, taps stay in pixels.
 
 ## Typing
 
 - `type` sends key presses. On a physical iPhone they follow the phone's hardware-keyboard layout, so on a non-US layout some letters swap (on QWERTZ, y and z). Check the result on a screenshot.
 - Text is ASCII only on Android and on a physical iPhone with the `phoned` backend; the WebDriverAgent backend (iOS 26 and older) also takes Unicode.
-- `key` sends named keys and buttons such as `home`, `enter` and `backspace`; the names differ per platform, and an unknown name prints the supported ones.
+- `key` sends named keys and buttons. `home` and `enter` work everywhere; `back` is Android only. `deck --help` lists every name per platform, and an unknown name prints the supported ones.
 
 ## Input lock
 
