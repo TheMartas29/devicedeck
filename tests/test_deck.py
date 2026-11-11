@@ -168,8 +168,26 @@ class Guard(unittest.TestCase):
         devs[0].allow_input = False
         table = deck.table(devs)
         row = next(line for line in table.splitlines() if line.startswith("00008101-AAAA"))
-        self.assertTrue(row.endswith("locked"))
+        self.assertTrue(row.endswith("locked (config)"))
         self.assertTrue(next(line for line in table.splitlines() if line.startswith("R58M123")).endswith("yes"))
+        with mock.patch.dict(os.environ, {"DEVICEDECK_LOCK_PHYSICAL_INPUT": "1"}):
+            rows = deck.table(devs).splitlines()
+        self.assertTrue(next(r for r in rows if r.startswith("R58M123")).endswith("locked (env)"))
+        self.assertTrue(next(r for r in rows if r.startswith("00008101-AAAA")).endswith("locked (config)"),
+                        "config wins over env")
+        self.assertTrue(next(r for r in rows if r.startswith("emulator-5554")).endswith("yes"))
+
+    def test_info_and_json_name_the_lock(self):
+        devs = fleet()
+        devs[0].allow_input = False
+        self.assertEqual(devs[0].input_text(), 'locked (config: "allowInput": false)')
+        self.assertEqual(devs[0].as_dict()["lockReason"], "config")
+        with mock.patch.dict(os.environ, {"DEVICEDECK_LOCK_PHYSICAL_INPUT": "1"}):
+            self.assertEqual(devs[4].input_text(), "locked (env: DEVICEDECK_LOCK_PHYSICAL_INPUT=1)")
+            info = dict(deck.ios_info_lines(devs[1], None))
+            self.assertEqual(info["input"], "locked (env: DEVICEDECK_LOCK_PHYSICAL_INPUT=1)")
+        self.assertEqual(devs[4].input_text(), "allowed")
+        self.assertIsNone(devs[4].as_dict()["lockReason"])
 
     def test_bad_args_fail_before_device(self):
         devs = fleet()

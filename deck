@@ -48,6 +48,7 @@ device name, or omitted when exactly one device is connected. An ambiguous
 
 commands:
   list                         devices: id, kind (ios|simulator|android), name, model, os, state, input
+                               (locked (config) / locked (env): see safety below)
                                (hidden) = hidden in the preview only; deck still controls it
                                --json for machines
   shot <file.png>              screenshot; prints the path, the pixel size and, on iOS, the
@@ -213,15 +214,26 @@ class Device:
         return self.state in ("connected", "booted", "device")
 
     @property
-    def input_allowed(self) -> bool:
+    def lock_reason(self) -> str | None:
+        """None when input is allowed, else "config" ("allowInput": false) or "env" (DEVICEDECK_LOCK_PHYSICAL_INPUT)."""
+        if not self.allow_input:
+            return "config"
         if self.physical and os.environ.get("DEVICEDECK_LOCK_PHYSICAL_INPUT") == "1":
-            return False
-        return self.allow_input
+            return "env"
+        return None
+
+    @property
+    def input_allowed(self) -> bool:
+        return self.lock_reason is None
+
+    def input_text(self) -> str:
+        return {None: "allowed", "config": 'locked (config: "allowInput": false)',
+                "env": "locked (env: DEVICEDECK_LOCK_PHYSICAL_INPUT=1)"}[self.lock_reason]
 
     def as_dict(self) -> dict:
         return {"id": self.id, "kind": self.kind, "name": self.name, "model": self.model, "os": self.os,
                 "state": self.state, "physical": self.physical, "inputAllowed": self.input_allowed,
-                "hidden": self.hidden}
+                "lockReason": self.lock_reason, "hidden": self.hidden}
 
     def unsupported(self, what: str) -> DeckError:
         return DeckError(f"{what} is not supported on {self.kind} devices")
@@ -278,7 +290,7 @@ def ios_info_lines(dev: Device, display: dict | None) -> list[tuple[str, str]]:
                   ("tap units", "points")]
     else:
         lines.append(("screen", "unknown (devicectl device info displays failed)"))
-    lines.append(("input", "allowed" if dev.input_allowed else "locked (see deck --help)"))
+    lines.append(("input", dev.input_text()))
     return lines
 
 
@@ -1072,7 +1084,7 @@ class AndroidDevice(Device):
             lines += [("density", f"{d} dpi"), ("scale", fmt(d / 160) if d % 160 else str(d // 160)),
                       ("points", f"{fmt(int(size[-1][0]) * 160 / d)}x{fmt(int(size[-1][1]) * 160 / d)} dp" if size else "?")]
         lines.append(("tap units", "pixels"))
-        lines.append(("input", "allowed" if self.input_allowed else "locked (see deck --help)"))
+        lines.append(("input", self.input_text()))
         return lines
 
 
@@ -1192,7 +1204,7 @@ def table(devices: list[Device]) -> str:
     rows = [("ID", "KIND", "NAME", "MODEL", "OS", "STATE", "INPUT")]
     for d in devices:
         rows.append((d.id, d.kind, d.name + (" (hidden)" if d.hidden else ""), d.model, d.os, d.state,
-                     "yes" if d.input_allowed else "locked"))
+                     "yes" if d.input_allowed else f"locked ({d.lock_reason})"))
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     return "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)
 
@@ -1257,7 +1269,7 @@ def main(argv: list[str]) -> int:
     if not dev.usable and cmd != "wda-stop":
         raise DeckError(f"{dev.name} ({dev.id}) is {dev.state}, not connected")
     if cmd in GUARDED_COMMANDS and not dev.input_allowed:
-        why = ("its config entry has \"allowInput\": false" if not dev.allow_input
+        why = ("its config entry has \"allowInput\": false" if dev.lock_reason == "config"
                else "DEVICEDECK_LOCK_PHYSICAL_INPUT=1 locks physical devices")
         raise DeckError(f"refused: input to {dev.name} ({dev.id}) is locked because {why}. "
                         f"Only the device owner can unlock it.", EXIT_GUARD)
