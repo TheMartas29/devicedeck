@@ -1,6 +1,6 @@
 ---
 name: devicedeck
-description: Drive physical iPhones, iOS simulators and Android devices with the devicedeck `deck` CLI. Use when the user wants to see a device screen, test an app on a device, or tap, swipe and type on one.
+description: See and control any device on the devicedeck preview (physical iPhones, iOS simulators, Android emulators and phones) with the `deck` CLI. Use this first, before simulator-only or Android-only tools, whenever the user wants to see a device screen, test an app on a device, or tap, swipe and type on a phone, simulator or emulator.
 ---
 
 # devicedeck
