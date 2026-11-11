@@ -1,0 +1,14 @@
+{
+  "name": "devicedeck",
+  "description": "The devicedeck plugin: drive iPhones, simulators and Android devices from Claude Code.",
+  "owner": {
+    "name": "Roman Martínek"
+  },
+  "plugins": [
+    {
+      "name": "devicedeck",
+      "source": "./",
+      "description": "See and control physical iPhones, iOS simulators and Android devices with the deck CLI."
+    }
+  ]
+}

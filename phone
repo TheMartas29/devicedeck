@@ -1,0 +1,296 @@
+#!/bin/bash
+# Control a physical iPhone through CoreDevice (pymobiledevice3 + devicectl).
+# Older single-iPhone CLI; see README.md. With several iPhones connected, set DEVICEDECK_UDID.
+
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PMD3="$DIR/venv/bin/pymobiledevice3"
+PY="$DIR/venv/bin/python"
+DEVICE="${DEVICEDECK_UDID:-${PHONE_UDID:-${PHONE_DEVICE:-}}}"
+OUT_DIR="${DEVICEDECK_RUNTIME_DIR:-${PHONE_OUT_DIR:-$HOME/Library/Caches/devicedeck}}"
+PORT="${DEVICEDECK_PORT:-7317}"  # preview page; Android + simulator streams on PORT+1
+URL="http://127.0.0.1:$PORT/"
+
+PHONEC="$DIR/phonec"
+SIZE_FILE="$OUT_DIR/last-shot-size"
+mkdir -p "$OUT_DIR" && chmod 700 "$OUT_DIR"
+[ -n "$DEVICE" ] && export DEVICEDECK_UDID="$DEVICE" PYMOBILEDEVICE3_UDID="$DEVICE"
+
+hid() {
+  local sub="$1"
+  shift
+  "$PMD3" developer core-device universal-hid-service "$sub" --userspace "$@"
+}
+
+daemon_up() {
+  "$PHONEC" ping >/dev/null 2>&1
+}
+
+via_daemon() {
+  local reply
+  if ! reply="$("$PHONEC" "$@")"; then
+    echo "$reply" >&2
+    return 1
+  fi
+}
+
+remember_size() {
+  python3 - "$1" "$SIZE_FILE" <<'PY'
+import struct, sys
+with open(sys.argv[1], "rb") as f:
+    head = f.read(24)
+w, h = struct.unpack(">II", head[16:24])
+open(sys.argv[2], "w").write(f"{w} {h}\n")
+PY
+}
+
+# The iPhone to use: DEVICEDECK_UDID, else the daemon's default, else the only connected one.
+device() {
+  if [ -z "$DEVICE" ]; then
+    DEVICE="$("$PHONEC" ping 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("udid") or "")' 2>/dev/null || true)"
+  fi
+  if [ -z "$DEVICE" ]; then
+    local tmp
+    tmp="$(mktemp)"
+    xcrun devicectl list devices --json-output "$tmp" -q >/dev/null 2>&1 || true
+    DEVICE="$(python3 - "$tmp" <<'PY'
+import json, sys
+try:
+    devices = json.load(open(sys.argv[1]))["result"]["devices"]
+except Exception:
+    devices = []
+found = [d["hardwareProperties"]["udid"] for d in devices
+         if d.get("hardwareProperties", {}).get("reality") == "physical"
+         and d.get("connectionProperties", {}).get("tunnelState") == "connected"]
+print(found[0] if len(found) == 1 else "")
+PY
+)"
+    rm -f "$tmp"
+  fi
+  if [ -z "$DEVICE" ]; then
+    echo "no single connected iPhone found; set DEVICEDECK_UDID" >&2
+    exit 1
+  fi
+  export DEVICEDECK_UDID="$DEVICE" PYMOBILEDEVICE3_UDID="$DEVICE"
+  echo "$DEVICE"
+}
+
+# Screen size: points from the daemon (read from the model), pixels from the last screenshot.
+# PHONE_PT_W/H and PHONE_PX_W/H override.
+sizes() {
+  PT_W="${PHONE_PT_W:-}"
+  PT_H="${PHONE_PT_H:-}"
+  if [ -z "$PT_W" ] || [ -z "$PT_H" ]; then
+    read -r PT_W PT_H < <("$PHONEC" ping 2>/dev/null | python3 -c '
+import json, sys
+p = json.load(sys.stdin).get("points") or ["", ""]
+print(p[0], p[1])' 2>/dev/null || echo "")
+  fi
+  if [ -z "$PT_W" ] || [ -z "$PT_H" ]; then
+    echo "unknown screen size; start the daemon (phone start) or set PHONE_PT_W and PHONE_PT_H" >&2
+    exit 1
+  fi
+  PX_W="${PHONE_PX_W:-}"
+  PX_H="${PHONE_PX_H:-}"
+  if [ -z "$PX_W" ] && [ -f "$SIZE_FILE" ]; then
+    read -r PX_W PX_H <"$SIZE_FILE"
+  fi
+}
+
+norm() {
+  local value="$1" size="$2"
+  python3 -c "v=round(float('$value')*65535/float('$size')); print(max(0, min(65535, v)))"
+}
+
+coords() {
+  sizes
+  local unit="pt"
+  local args=()
+  for a in "$@"; do
+    if [ "$a" = "--px" ]; then unit="px"; else args+=("$a"); fi
+  done
+  local w="$PT_W" h="$PT_H"
+  if [ "$unit" = "px" ]; then
+    if [ -z "$PX_W" ]; then echo "take a screenshot first (phone shot), --px uses its size" >&2; exit 1; fi
+    w="$PX_W"; h="$PX_H"
+  fi
+  local result=()
+  local i=0
+  for a in "${args[@]}"; do
+    if [ $((i % 2)) -eq 0 ]; then result+=("$(norm "$a" "$w")"); else result+=("$(norm "$a" "$h")"); fi
+    i=$((i + 1))
+  done
+  echo "${result[@]}"
+}
+
+usage() {
+  cat <<EOF
+phone start | stop | status      the daemon (phoned) and the preview page on http://127.0.0.1:$PORT/ (DEVICEDECK_PORT)
+phone shot [file.png]            screenshot (default <runtime dir>/shot-<time>.png)
+phone tap X Y [--px]             tap; X Y in points, with --px in pixels of the last screenshot
+phone drag X1 Y1 X2 Y2 [--px]    drag (scroll, swipe between pages)
+phone type "text"                type through the virtual hardware keyboard (keyboard layout applies)
+phone key NAME [count]           backspace|enter|escape|tab|left|right|up|down
+phone button NAME                home|lock|volume-up|volume-down|mute|siri
+phone elements                   accessibility captions on screen (no coordinates)
+phone clip "text"                put text on the phone's clipboard
+phone apps [all]                 installed apps ("all" adds system apps)
+phone launch BUNDLE [URL]        launch (or relaunch) an app, optionally with a deep link
+phone kill BUNDLE                quit an app
+phone preview                    same as start: the view-only preview page
+phone mount                      mount the developer disk image (once after every phone restart)
+phone info                       iOS version, Developer Mode, connection
+
+With several iPhones connected, choose one with DEVICEDECK_UDID=<udid>.
+EOF
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  shot)
+    mkdir -p "$OUT_DIR"
+    file="${1:-$OUT_DIR/shot-$(date +%H%M%S).png}"
+    case "$file" in /*) ;; *) file="$PWD/$file" ;; esac
+    if daemon_up; then
+      via_daemon shot "$file"
+    else
+      "$PMD3" developer core-device screen-capture screenshot --userspace "$file" >/dev/null 2>&1
+    fi
+    remember_size "$file"
+    echo "$file"
+    ;;
+  tap)
+    read -r x y <<<"$(coords "$@")"
+    if daemon_up; then via_daemon tap "$x" "$y"; else hid tap -- "$x" "$y" >/dev/null; fi
+    ;;
+  drag)
+    read -r x1 y1 x2 y2 <<<"$(coords "$@")"
+    if daemon_up; then via_daemon drag "$x1" "$y1" "$x2" "$y2"; else hid drag -- "$x1" "$y1" "$x2" "$y2" >/dev/null; fi
+    ;;
+  type)
+    if daemon_up; then via_daemon type "$1"; else hid type "$1" >/dev/null; fi
+    ;;
+  key)
+    if daemon_up; then via_daemon key "$1" "${2:-1}"; else hid key "$1" --count "${2:-1}" >/dev/null; fi
+    ;;
+  button)
+    if daemon_up; then
+      via_daemon button "$1"
+    else
+      "$PMD3" developer core-device hid button --userspace "$1" press >/dev/null
+    fi
+    ;;
+  elements)
+    if daemon_up; then
+      "$PHONEC" elements | python3 -c "
+import json, sys
+for c in json.load(sys.stdin).get('captions') or []:
+    print(c)"
+      exit 0
+    fi
+    "$PMD3" developer accessibility list-items 2>/dev/null | python3 -c "
+import json, sys
+for e in json.load(sys.stdin):
+    print(e.get('caption') or e.get('spoken_description') or '')"
+    ;;
+  clip)
+    device >/dev/null
+    printf '%s' "$1" | xcrun devicectl device pasteboard copy --device "$DEVICE" -q
+    ;;
+  apps)
+    device >/dev/null
+    xcrun devicectl device info apps --device "$DEVICE" ${1:+--include-all-apps} 2>/dev/null | sed -n '/^Name/,$p'
+    ;;
+  launch)
+    device >/dev/null
+    if [ -n "${2:-}" ]; then
+      xcrun devicectl device process launch --device "$DEVICE" --terminate-existing --payload-url "$2" "$1" -q
+    else
+      xcrun devicectl device process launch --device "$DEVICE" --terminate-existing "$1" -q
+    fi
+    ;;
+  kill)
+    device >/dev/null
+    apps_json="$(mktemp)"
+    procs_json="$(mktemp)"
+    xcrun devicectl device info apps --device "$DEVICE" --include-all-apps --bundle-id "$1" --json-output "$apps_json" -q >/dev/null 2>&1
+    xcrun devicectl device info processes --device "$DEVICE" --json-output "$procs_json" -q >/dev/null 2>&1
+    pid="$(python3 - "$apps_json" "$procs_json" <<'PY'
+import json, sys
+apps = json.load(open(sys.argv[1])).get("result", {}).get("apps", [])
+procs = json.load(open(sys.argv[2])).get("result", {}).get("runningProcesses", [])
+for app in apps:
+    root = app.get("url", "")
+    for p in procs:
+        rest = p.get("executable", "")[len(root):] if p.get("executable", "").startswith(root) else None
+        if rest and "/" not in rest:
+            print(p.get("processIdentifier"))
+            raise SystemExit
+PY
+)"
+    rm -f "$apps_json" "$procs_json"
+    if [ -z "$pid" ]; then
+      echo "process $1 is not running" >&2
+      exit 1
+    fi
+    xcrun devicectl device process terminate --device "$DEVICE" --pid "$pid" -q
+    ;;
+  start|preview)
+    if daemon_up; then
+      echo "phoned is already running, preview at $URL"
+      exit 0
+    fi
+    nohup "$PY" "$DIR/phoned.py" --preview >"$OUT_DIR/phoned.log" 2>&1 &
+    for _ in $(seq 1 30); do
+      sleep 1
+      if daemon_up; then
+        echo "phoned is running, preview at $URL, log $OUT_DIR/phoned.log"
+        exit 0
+      fi
+    done
+    echo "phoned did not start, see $OUT_DIR/phoned.log" >&2
+    exit 1
+    ;;
+  stop)
+    if "$PHONEC" quit >/dev/null 2>&1; then
+      for _ in $(seq 1 30); do
+        [ -S "${DEVICEDECK_SOCK:-${PHONED_SOCK:-$OUT_DIR/phoned.sock}}" ] || break
+        sleep 1
+      done
+    fi
+    echo "phoned stopped"
+    ;;
+  status)
+    "$PHONEC" ping || echo "phoned is not running"
+    ;;
+  mount)
+    "$PMD3" mounter auto-mount
+    ;;
+  info)
+    device >/dev/null
+    tmp="$(mktemp)"
+    xcrun devicectl device info details --device "$DEVICE" --json-output "$tmp" -q >/dev/null 2>&1
+    python3 - "$tmp" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1])).get("result", {})
+props = r.get("deviceProperties", {})
+conn = r.get("connectionProperties", {})
+print("name:", props.get("name"))
+print("iOS:", props.get("osVersionNumber"))
+print("developerMode:", props.get("developerModeStatus"))
+print("ddiServicesAvailable:", props.get("ddiServicesAvailable"))
+print("transport:", conn.get("transportType"), conn.get("tunnelState"))
+PY
+    rm -f "$tmp"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

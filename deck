@@ -1,0 +1,1274 @@
+#!/bin/sh
+''':'
+# Shell part: run the Python below with the project venv if there is one, else python3.
+self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+venv="$(dirname "$self")/venv/bin/python3"
+if [ -x "$venv" ]; then exec "$venv" "$self" "$@"; fi
+exec python3 "$self" "$@"
+'''
+# deck: see and control iPhones, iOS simulators and Android devices with one command set.
+# Stdlib only. Backends:
+#   ios        physical iPhone/iPad: devicectl + the phoned daemon socket (pymobiledevice3 fallback)
+#   simulator  booted iOS simulator: simctl + the RocketSim CLI
+#   android    emulator or USB device: adb
+from __future__ import annotations
+
+import base64
+import concurrent.futures
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
+import zlib
+from pathlib import Path
+
+HERE = Path(os.path.realpath(__file__)).parent
+INPUT_COMMANDS = {"tap", "swipe", "type", "key", "launch"}
+GUARDED_COMMANDS = INPUT_COMMANDS | {"wda-setup"}
+COMMANDS = {"shot", "elements", "tap", "swipe", "type", "key", "launch", "apps", "info", "wda-setup", "wda-stop"}
+EXIT_ERROR, EXIT_USAGE, EXIT_GUARD = 1, 2, 3
+
+USAGE = """\
+usage: deck list [--json]
+       deck [<dev>] <command> [args]
+
+<dev> is a device id (UDID / adb serial), a case-insensitive substring of the
+device name, or omitted when exactly one device is connected. An ambiguous
+<dev> lists the candidates and exits 2.
+
+commands:
+  list                         devices: id, kind (ios|simulator|android), name, model, os, state, input
+                               (hidden) = hidden in the preview only; deck still controls it
+                               --json for machines
+  shot <file.png>              screenshot; prints the path and the pixel size
+  elements                     accessibility / UI tree as compact text
+                               (centre point to tap, then [x,y wxh] frame, in tap units)
+  tap <x> <y>                  points on iOS and simulators, pixels on Android
+  swipe <x1> <y1> <x2> <y2> [ms]
+  type <text>                  ASCII text into the focused field (WDA also takes Unicode)
+  key <name>                   ios:       home lock volume-up volume-down mute siri
+                                          enter backspace escape tab up down left right
+                               ios (WDA): home lock volume-up volume-down enter backspace tab escape
+                               simulator: home lock side siri apple-pay enter
+                               android:   home back enter backspace tab escape up down left right
+                                          menu power volume-up volume-down app-switch,
+                                          or any KEYCODE_* name or number
+  launch <bundle id | package> Android also accepts package/activity
+  apps [--all]                 installed apps: bundle id / package, name, version
+                               default: user apps (physical iOS: only development-signed apps);
+                               --all adds system apps (and App Store apps on physical iOS)
+  info                         model, os, screen size in pixels and points, scale, iOS backend
+  wda-setup                    physical iPhone: build and install WebDriverAgent with your team,
+                               start it, and print the steps that need a human on the device
+  wda-stop                     physical iPhone: stop the WebDriverAgent runner and port forward
+
+physical iPhone backends (chosen per device, override with DEVICEDECK_IOS_BACKEND
+or "iosBackend" in the config):
+  phoned  iOS 27 and newer: the phoned daemon (CoreDevice HID, DVT accessibility)
+  wda     iOS 26 and older: WebDriverAgent over a USB port forward. Run deck <dev> wda-setup
+          once; later commands start the runner and the forward by themselves.
+          elements then prints frames in points, like the simulator.
+
+safety (personal phones):
+  Input commands (tap swipe type key launch) are allowed on every device by default.
+  Lock a personal phone with "allowInput": false in its config entry: input to it
+  then exits 3. DEVICEDECK_LOCK_PHYSICAL_INPUT=1 locks every physical device.
+
+config: $DEVICEDECK_CONFIG, default ~/.config/devicedeck/devices.json
+  {"devices":[{"id":"<udid or serial>","kind":"ios|simulator|android",
+               "name":"display name or null","hidden":false,"order":0,"allowInput":true}]}
+  physical iPhones may also set: iosBackend, wdaTeam, wdaBundleId, wdaProject, wdaXctestrun, wdaUrl, wdaPort
+
+environment:
+  DEVICEDECK_CONFIG               config path
+  DEVICEDECK_LOCK_PHYSICAL_INPUT  1 = refuse input on every physical device
+  DEVICEDECK_SOCK (PHONED_SOCK)   phoned socket, default $DEVICEDECK_RUNTIME_DIR/phoned.sock
+  DEVICEDECK_RUNTIME_DIR          temp files, default ~/Library/Caches/devicedeck
+  DEVICEDECK_IOS_BACKEND          wda | phoned, forces the physical iPhone backend
+  DEVICEDECK_WDA_TEAM             Apple development team id for wda-setup (config: wdaTeam)
+  DEVICEDECK_WDA_BUNDLE_ID        runner bundle id, unique to you, e.g. com.<you>.WebDriverAgentRunner
+                                  (config: wdaBundleId)
+  DEVICEDECK_WDA_PROJECT          WebDriverAgent checkout with WebDriverAgent.xcodeproj (config: wdaProject;
+                                  default: Appium's copy in ~/.appium if present)
+  DEVICEDECK_WDA_XCTESTRUN        prebuilt .xctestrun to run instead of the wda-setup build (config: wdaXctestrun)
+  DEVICEDECK_WDA_URL              use a WebDriverAgent you run yourself; deck starts nothing (config: wdaUrl)
+  DEVICEDECK_WDA_PORT             local port of the forward (config: wdaPort; default derived from the UDID)
+  ADB, ROCKETSIM, PYMOBILEDEVICE3 override the tool paths
+
+exit codes: 0 ok, 1 command failed, 2 usage / no or ambiguous device, 3 input to a locked device refused
+"""
+
+
+class DeckError(Exception):
+    def __init__(self, message: str, code: int = EXIT_ERROR) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def runtime_dir() -> Path:
+    path = Path(os.environ.get("DEVICEDECK_RUNTIME_DIR") or Path.home() / "Library/Caches/devicedeck").expanduser()
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def run(cmd: list[str], *, check: bool = True, timeout: float = 60, text: bool = True,
+        env: dict | None = None, input: str | None = None) -> subprocess.CompletedProcess:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=text, timeout=timeout,
+                              env={**os.environ, **env} if env else None, input=input)
+    except FileNotFoundError:
+        raise DeckError(f"{cmd[0]} not found") from None
+    except subprocess.TimeoutExpired:
+        raise DeckError(f"timed out after {timeout:.0f}s: {' '.join(cmd[:4])}") from None
+    if check and proc.returncode != 0:
+        err = proc.stderr if isinstance(proc.stderr, str) else proc.stderr.decode("utf-8", "replace")
+        out = proc.stdout if isinstance(proc.stdout, str) else ""
+        detail = (err.strip() or out.strip())[-800:]
+        raise DeckError(f"{' '.join(cmd[:4])} failed ({proc.returncode}): {detail}")
+    return proc
+
+
+def png_size(path: Path) -> tuple[int, int] | None:
+    with open(path, "rb") as f:
+        head = f.read(24)
+    if head[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    return struct.unpack(">II", head[16:24])
+
+
+def num(value: str, what: str) -> float:
+    try:
+        return float(value)
+    except ValueError:
+        raise DeckError(f"{what} must be a number, got {value!r}", EXIT_USAGE) from None
+
+
+def fmt(v: float) -> str:
+    return str(int(round(v))) if abs(v - round(v)) < 0.05 else f"{v:.1f}"
+
+
+def ascii_only(text: str) -> None:
+    bad = sorted({c for c in text if not (32 <= ord(c) < 127 or c == "\n")})
+    if bad:
+        raise DeckError(f"only ASCII text is supported, not {''.join(bad)!r}")
+
+
+def which(env_name: str, *candidates: str) -> str | None:
+    override = os.environ.get(env_name)
+    if override:
+        return override
+    for c in candidates:
+        found = shutil.which(c) if "/" not in c else (c if os.access(c, os.X_OK) else None)
+        if found:
+            return found
+    return None
+
+
+# ---------------------------------------------------------------- config
+
+
+def load_config() -> dict[str, dict]:
+    default = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "devicedeck" / "devices.json"
+    path = Path(os.environ.get("DEVICEDECK_CONFIG") or default).expanduser()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"deck: ignoring config {path}: {e}", file=sys.stderr)
+        return {}
+    return {str(d["id"]): d for d in data.get("devices", []) if isinstance(d, dict) and d.get("id")}
+
+
+# ---------------------------------------------------------------- device model
+
+
+class Device:
+    kind = ""
+    physical = False
+
+    def __init__(self, id: str, name: str, model: str, os_: str, state: str) -> None:
+        self.id, self.name, self.model, self.os, self.state = id, name, model, os_, state
+        self.hidden = False
+        self.order = 0
+        self.allow_input = True
+        self.config: dict = {}
+
+    @property
+    def usable(self) -> bool:
+        return self.state in ("connected", "booted", "device")
+
+    @property
+    def input_allowed(self) -> bool:
+        if self.physical and os.environ.get("DEVICEDECK_LOCK_PHYSICAL_INPUT") == "1":
+            return False
+        return self.allow_input
+
+    def as_dict(self) -> dict:
+        return {"id": self.id, "kind": self.kind, "name": self.name, "model": self.model, "os": self.os,
+                "state": self.state, "physical": self.physical, "inputAllowed": self.input_allowed,
+                "hidden": self.hidden}
+
+    def unsupported(self, what: str) -> DeckError:
+        return DeckError(f"{what} is not supported on {self.kind} devices")
+
+    # Every backend implements these.
+    def shot(self, path: Path) -> str: raise self.unsupported("shot")
+    def elements(self) -> list[str]: raise self.unsupported("elements")
+    def tap(self, x: float, y: float) -> str: raise self.unsupported("tap")
+    def swipe(self, x1: float, y1: float, x2: float, y2: float, ms: int) -> str: raise self.unsupported("swipe")
+    def type_text(self, text: str) -> str: raise self.unsupported("type")
+    def key(self, name: str) -> str: raise self.unsupported("key")
+    def launch(self, target: str) -> str: raise self.unsupported("launch")
+    def apps(self, all_apps: bool) -> list[str]: raise self.unsupported("apps")
+    def info(self) -> list[tuple[str, str]]: raise self.unsupported("info")
+
+
+# ---------------------------------------------------------------- iOS (shared by physical + simulator)
+
+
+def devicectl_json(args: list[str], timeout: float = 60) -> dict:
+    fd, tmp = tempfile.mkstemp(suffix=".json", dir=runtime_dir())
+    os.close(fd)
+    try:
+        run(["xcrun", "devicectl", *args, "--json-output", tmp, "-q"], timeout=timeout)
+        return json.loads(Path(tmp).read_text()).get("result", {})
+    finally:
+        os.unlink(tmp)
+
+
+def ios_display(udid: str) -> dict | None:
+    """Pixel bounds and point scale of the primary display, from the device itself."""
+    try:
+        result = devicectl_json(["device", "info", "displays", "--device", udid], timeout=20)
+    except DeckError:
+        return None
+    for d in result.get("displays", []):
+        if d.get("primary"):
+            (_, _), (w, h) = d["bounds"]
+            scale = float(d.get("pointScale") or 1)
+            return {"px": (int(w), int(h)), "scale": scale, "pt": (w / scale, h / scale),
+                    "orientation": d.get("currentOrientation")}
+    return None
+
+
+def ios_info_lines(dev: Device, display: dict | None) -> list[tuple[str, str]]:
+    lines = [("id", dev.id), ("kind", dev.kind), ("name", dev.name), ("model", dev.model),
+             ("os", dev.os), ("state", dev.state)]
+    if display:
+        pw, ph = display["px"]
+        tw, th = display["pt"]
+        lines += [("screen", f"{pw}x{ph} px"), ("points", f"{fmt(tw)}x{fmt(th)} pt"),
+                  ("scale", fmt(display["scale"])), ("orientation", str(display["orientation"])),
+                  ("tap units", "points")]
+    else:
+        lines.append(("screen", "unknown (devicectl device info displays failed)"))
+    lines.append(("input", "allowed" if dev.input_allowed else "locked (see deck --help)"))
+    return lines
+
+
+# ---------------------------------------------------------------- physical iPhone
+
+
+def phoned_sockets() -> list[str]:
+    seen: list[str] = []
+    candidates = [os.environ.get("DEVICEDECK_SOCK", ""), os.environ.get("PHONED_SOCK", ""),
+                  str(runtime_dir() / "phoned.sock")]
+    for c in candidates:
+        if c and c not in seen and os.path.exists(c):
+            seen.append(c)
+    return seen
+
+
+def phoned_call(sock_path: str, line: str, timeout: float = 120) -> dict:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path)
+        s.sendall(line.encode() + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    return json.loads(buf.decode() or "{}")
+
+
+def setting(dev: Device, env: str, key: str, default=None):
+    """Environment first, then the device's config entry, then the default."""
+    value = os.environ.get(env)
+    if value:
+        return value
+    value = dev.config.get(key)
+    return default if value in (None, "") else value
+
+
+def pid_alive(pid: int | None, needle: str) -> bool:
+    if not pid:
+        return False
+    proc = run(["ps", "-p", str(pid), "-o", "command="], check=False, timeout=5)
+    return proc.returncode == 0 and needle in proc.stdout
+
+
+def log_tail(path: Path, lines: int = 25) -> str:
+    try:
+        return "\n".join(path.read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return ""
+
+
+WDA_DEVICE_PORT = 8100
+WDA_TRUST_STEPS = """On the iPhone:
+  1. Settings > General > VPN & Device Management > (your developer account) > Trust.
+  2. Settings > Developer > Enable UI Automation (iOS 16 and newer).
+  3. Keep the phone unlocked while WebDriverAgent starts."""
+WDA_UNTRUSTED = re.compile(r"not (been )?trusted|untrusted developer|invalid code signature|"
+                           r"profile has not been explicitly trusted|Unable to launch .*WebDriverAgentRunner", re.I)
+
+
+class WDA:
+    """WebDriverAgent on one physical iPhone: build, start, stop and REST calls (coordinates in points)."""
+
+    def __init__(self, dev: Device) -> None:
+        self.dev = dev
+        self.port = int(setting(dev, "DEVICEDECK_WDA_PORT", "wdaPort", 0) or 0) \
+            or 8200 + zlib.crc32(dev.id.encode()) % 600
+        external = setting(dev, "DEVICEDECK_WDA_URL", "wdaUrl")
+        self.managed = not external
+        self.url = (external or f"http://127.0.0.1:{self.port}").rstrip("/")
+        self.dir = runtime_dir() / "wda"
+        self.state_file = self.dir / f"{dev.id}.json"
+        self._sid: str | None = None
+
+    # -- REST
+
+    def http(self, method: str, path: str, body=None, timeout: float = 60) -> dict:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.url + path, data=data, method=method,
+                                     headers={"Content-Type": "application/json"} if data else {})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+        except (urllib.error.URLError, OSError) as e:
+            raise DeckError(f"WebDriverAgent at {self.url} is not reachable: {getattr(e, 'reason', e)}") from None
+        try:
+            reply = json.loads(raw or b"{}")
+        except ValueError:
+            raise DeckError(f"WebDriverAgent: unexpected response {raw[:200]!r}") from None
+        value = reply.get("value")
+        if isinstance(value, dict) and value.get("error"):
+            raise DeckError(f"WebDriverAgent: {value['error']}: {str(value.get('message', ''))[:300]}")
+        return reply
+
+    def status(self) -> dict | None:
+        try:
+            reply = self.http("GET", "/status", timeout=3)
+        except DeckError:
+            return None
+        value = reply.get("value") or {}
+        return reply if value.get("ready", True) else None
+
+    def ensure(self) -> None:
+        if self.status():
+            return
+        if not self.managed:
+            raise DeckError(f"no WebDriverAgent answers at {self.url} (DEVICEDECK_WDA_URL / wdaUrl)")
+        self.start()
+
+    def session(self) -> str:
+        if self._sid:
+            return self._sid
+        self.ensure()
+        sid = (self.status() or {}).get("sessionId")
+        if not sid:
+            reply = self.http("POST", "/session", {"capabilities": {"alwaysMatch": {}}})
+            sid = reply.get("sessionId") or (reply.get("value") or {}).get("sessionId")
+            if not sid:
+                raise DeckError("WebDriverAgent did not create a session")
+            self.http("POST", f"/session/{sid}/appium/settings",
+                      {"settings": {"waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}})
+        self._sid = sid
+        return sid
+
+    def pointer(self, actions: list[dict]) -> None:
+        self.http("POST", f"/session/{self.session()}/actions", {"actions": [{
+            "type": "pointer", "id": "finger1", "parameters": {"pointerType": "touch"}, "actions": actions}]})
+
+    def tap(self, x: float, y: float) -> None:
+        self.pointer([{"type": "pointerMove", "duration": 0, "x": x, "y": y},
+                      {"type": "pointerDown", "button": 0}, {"type": "pause", "duration": 60},
+                      {"type": "pointerUp", "button": 0}])
+
+    def swipe(self, x1: float, y1: float, x2: float, y2: float, ms: int) -> None:
+        self.pointer([{"type": "pointerMove", "duration": 0, "x": x1, "y": y1},
+                      {"type": "pointerDown", "button": 0}, {"type": "pause", "duration": 100},
+                      {"type": "pointerMove", "duration": ms, "x": x2, "y": y2},
+                      {"type": "pointerUp", "button": 0}])
+
+    def keys(self, text: str) -> None:
+        self.http("POST", f"/session/{self.session()}/wda/keys", {"value": list(text)}, timeout=120)
+
+    KEY_TEXT = {"enter": "\n", "backspace": "\b", "tab": "\t", "escape": "\x1b"}
+    BUTTONS = {"volume-up": "volumeup", "volume-down": "volumedown"}
+
+    def key(self, name: str) -> None:
+        if name == "home":
+            self.ensure()
+            self.http("POST", "/wda/homescreen")
+        elif name == "lock":
+            self.ensure()
+            self.http("POST", "/wda/lock")
+        elif name in self.BUTTONS:
+            self.http("POST", f"/session/{self.session()}/wda/pressButton", {"name": self.BUTTONS[name]})
+        elif name in self.KEY_TEXT:
+            self.keys(self.KEY_TEXT[name])
+        else:
+            raise DeckError(f"unknown key {name!r} for ios (WDA); supported: home lock "
+                            f"{' '.join(self.BUTTONS)} {' '.join(self.KEY_TEXT)}", EXIT_USAGE)
+
+    def shot(self, path: Path) -> None:
+        self.ensure()
+        path.write_bytes(base64.b64decode(self.http("GET", "/screenshot")["value"]))
+
+    def elements(self) -> list[str]:
+        self.ensure()
+        tree = self.http("GET", "/source?format=json", timeout=120).get("value") or {}
+        lines: list[str] = []
+
+        def walk(node: dict, depth: int) -> None:
+            r = node.get("rect") or {}
+            label, name, value = node.get("label"), node.get("name"), node.get("value")
+            w, h = float(r.get("width") or 0), float(r.get("height") or 0)
+            if (label or value or name) and w > 0 and h > 0 and node.get("isVisible") not in (False, "0"):
+                role = str(node.get("type", "?")).replace("XCUIElementType", "")
+                lines.append(element_line(role, label or name, value, name if name and name != label else None,
+                                          float(r.get("x") or 0), float(r.get("y") or 0), w, h, depth))
+            for child in node.get("children") or []:
+                walk(child, depth + 1)
+
+        walk(tree, 0)
+        return lines
+
+    def launch(self, bundle: str) -> None:
+        self.http("POST", f"/session/{self.session()}/wda/apps/launch", {"bundleId": bundle})
+
+    def window_size(self) -> tuple[float, float] | None:
+        try:
+            v = self.http("GET", "/window/size", timeout=10).get("value") or {}
+            return float(v["width"]), float(v["height"])
+        except (DeckError, KeyError, TypeError, ValueError):
+            return None
+
+    # -- build / run
+
+    def project(self) -> Path | None:
+        candidates = [setting(self.dev, "DEVICEDECK_WDA_PROJECT", "wdaProject"),
+                      Path.home() / ".appium/node_modules/appium-xcuitest-driver/node_modules/appium-webdriveragent",
+                      HERE / "WebDriverAgent"]
+        for c in candidates:
+            if c and (Path(c).expanduser() / "WebDriverAgent.xcodeproj").is_dir():
+                return Path(c).expanduser()
+        return None
+
+    def derived_data(self) -> Path:
+        return self.dir / "DerivedData"
+
+    def xctestrun(self) -> Path | None:
+        explicit = setting(self.dev, "DEVICEDECK_WDA_XCTESTRUN", "wdaXctestrun")
+        if explicit:
+            path = Path(explicit).expanduser()
+            if not path.is_file():
+                raise DeckError(f"xctestrun not found: {path}")
+            return path
+        found = sorted((self.derived_data() / "Build/Products").glob("WebDriverAgentRunner_iphoneos*.xctestrun"),
+                       key=lambda p: p.stat().st_mtime)
+        return found[-1] if found else None
+
+    def load_state(self) -> dict:
+        try:
+            return json.loads(self.state_file.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def spawn(self, cmd: list[str], log: Path) -> int:
+        with open(log, "ab") as out:
+            proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    start_new_session=True)
+        return proc.pid
+
+    def start(self) -> None:
+        xctestrun = self.xctestrun()
+        if not xctestrun:
+            raise DeckError(f"WebDriverAgent is not built for this Mac yet; run: deck {self.dev.id} wda-setup")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        state = self.load_state()
+        run_log, fwd_log = self.dir / f"{self.dev.id}.run.log", self.dir / f"{self.dev.id}.forward.log"
+        if not pid_alive(state.get("runner"), self.dev.id):
+            run_log.write_text("")
+            state["runner"] = self.spawn(["xcodebuild", "test-without-building", "-xctestrun", str(xctestrun),
+                                          "-destination", f"id={self.dev.id}"], run_log)
+        if not pid_alive(state.get("forward"), self.dev.id):
+            exe = which("PYMOBILEDEVICE3", str(HERE / "venv/bin/pymobiledevice3"), "pymobiledevice3")
+            if not exe:
+                raise DeckError("pymobiledevice3 is needed for the WebDriverAgent port forward")
+            state["forward"] = self.spawn([exe, "usbmux", "forward", "--serial", self.dev.id,
+                                           str(self.port), str(WDA_DEVICE_PORT)], fwd_log)
+        state["port"] = self.port
+        self.state_file.write_text(json.dumps(state))
+        deadline = time.time() + float(os.environ.get("DEVICEDECK_WDA_TIMEOUT", "120"))
+        while time.time() < deadline:
+            if self.status():
+                return
+            text = log_tail(run_log, 200)
+            if WDA_UNTRUSTED.search(text):
+                raise DeckError("the iPhone does not trust the WebDriverAgent developer certificate yet.\n"
+                                + WDA_TRUST_STEPS + f"\nThen run the command again. Log: {run_log}")
+            if not pid_alive(state["runner"], self.dev.id):
+                raise DeckError(f"the WebDriverAgent runner exited. Last lines of {run_log}:\n{log_tail(run_log)}")
+            time.sleep(2)
+        raise DeckError(f"WebDriverAgent did not become ready at {self.url}; see {run_log} and {fwd_log}")
+
+    def stop(self) -> str:
+        state = self.load_state()
+        stopped = []
+        for key in ("forward", "runner"):
+            pid = state.get(key)
+            if pid_alive(pid, self.dev.id):
+                try:
+                    os.killpg(pid, 15)
+                except OSError:
+                    os.kill(pid, 15)
+                stopped.append(key)
+        try:
+            self.state_file.unlink()
+        except FileNotFoundError:
+            pass
+        return f"stopped {' and '.join(stopped)}" if stopped else "WebDriverAgent was not running (started by deck)"
+
+    def setup(self) -> str:
+        team = setting(self.dev, "DEVICEDECK_WDA_TEAM", "wdaTeam")
+        bundle = setting(self.dev, "DEVICEDECK_WDA_BUNDLE_ID", "wdaBundleId")
+        project = self.project()
+        missing = []
+        if not team:
+            missing.append("DEVICEDECK_WDA_TEAM=<team id> (Xcode > Settings > Accounts, or the "
+                           "OU of your Apple Development certificate)")
+        if not bundle:
+            missing.append("DEVICEDECK_WDA_BUNDLE_ID=com.<you>.WebDriverAgentRunner (any id your team can sign)")
+        if not project:
+            missing.append("DEVICEDECK_WDA_PROJECT=<path> to a WebDriverAgent checkout "
+                           "(git clone https://github.com/appium/WebDriverAgent)")
+        if missing:
+            raise DeckError("wda-setup needs (environment or the device's config entry):\n  "
+                            + "\n  ".join(missing), EXIT_USAGE)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        log = self.dir / "build.log"
+        print(f"Before you start, on the iPhone: Developer Mode on, this Mac trusted, phone unlocked.")
+        print(f"[1/2] building WebDriverAgent for {self.dev.name} with team {team} (log {log}) ...", flush=True)
+        cmd = ["xcodebuild", "build-for-testing", "-project", str(project / "WebDriverAgent.xcodeproj"),
+               "-scheme", "WebDriverAgentRunner", "-destination", f"id={self.dev.id}",
+               "-derivedDataPath", str(self.derived_data()), "-allowProvisioningUpdates",
+               f"DEVELOPMENT_TEAM={team}", "CODE_SIGN_STYLE=Automatic",
+               f"PRODUCT_BUNDLE_IDENTIFIER={bundle}", "COMPILER_INDEX_STORE_ENABLE=NO"]
+        proc = run(cmd, check=False, timeout=3600)
+        log.write_text(proc.stdout + proc.stderr)
+        if proc.returncode != 0:
+            text = proc.stdout + proc.stderr
+            hints = []
+            if re.search(r"No Account for Team|No accounts|requires a development team", text):
+                hints.append("Add your Apple ID in Xcode > Settings > Accounts and check the team id.")
+            if re.search(r"No profiles for|failed registering bundle identifier|is not available", text):
+                hints.append("Pick a different DEVICEDECK_WDA_BUNDLE_ID; this one belongs to someone else.")
+            if re.search(r"Developer Mode|developer mode", text):
+                hints.append("Turn on Settings > Privacy & Security > Developer Mode on the iPhone.")
+            if re.search(r"is not registered|device .* not .* provisioning", text, re.I):
+                hints.append("Free accounts cannot register devices automatically; use a paid team.")
+            raise DeckError("WebDriverAgent build failed.\n" + "\n".join(hints)
+                            + f"\nLast lines of {log}:\n{log_tail(log)}")
+        if not self.xctestrun():
+            raise DeckError(f"the build finished but no .xctestrun was found in {self.derived_data()}")
+        print(f"[2/2] installing and starting the runner on the iPhone ...", flush=True)
+        self.stop()
+        self._sid = None
+        self.start()
+        return (f"WebDriverAgent is ready at {self.url} for {self.dev.name}.\n"
+                f"deck {self.dev.id} ... now uses it for iOS {self.dev.os.split()[-1]}; "
+                f"stop it with: deck {self.dev.id} wda-stop")
+
+
+class IOSDevice(Device):
+    kind = "ios"
+    physical = True
+    HID_MAX = 65535
+    KEYS = ("backspace", "enter", "escape", "tab", "left", "right", "up", "down")
+    BUTTONS = ("home", "lock", "volume-up", "volume-down", "mute", "siri")
+
+    def __init__(self, *a, product_type: str = "") -> None:
+        super().__init__(*a)
+        self.product_type = product_type
+        self._sock: str | None | bool = False
+        self._prefix = ""
+        self._points: tuple[float, float] | None = None
+        self._display: dict | None | bool = False
+        self._wda: WDA | None = None
+
+    def backend(self) -> str:
+        forced = setting(self, "DEVICEDECK_IOS_BACKEND", "iosBackend")
+        if forced:
+            if forced not in ("wda", "phoned"):
+                raise DeckError(f"iOS backend must be wda or phoned, not {forced!r}", EXIT_USAGE)
+            return forced
+        m = re.search(r"(\d+)", self.os.split()[-1] if self.os else "")
+        return "wda" if m and int(m.group(1)) < 27 else "phoned"
+
+    @property
+    def wda(self) -> WDA:
+        if self._wda is None:
+            self._wda = WDA(self)
+        return self._wda
+
+    def display(self) -> dict | None:
+        if self._display is False:
+            self._display = ios_display(self.id)
+        return self._display  # type: ignore[return-value]
+
+    def points(self) -> tuple[float, float]:
+        self.sock()
+        if self._points:
+            return self._points
+        d = self.display()
+        if not d:
+            raise DeckError("cannot read the screen size (devicectl device info displays failed)")
+        return d["pt"]
+
+    def sock(self) -> str | None:
+        """The phoned socket that serves this device, if a daemon is up for it.
+
+        A hub (ping lists "devices") takes an "@<udid>" prefix; a single-device daemon reports "udid".
+        """
+        if self._sock is False:
+            self._sock = None
+            for path in phoned_sockets():
+                try:
+                    reply = phoned_call(path, "ping", timeout=3)
+                except (OSError, ValueError):
+                    continue
+                if not reply.get("ok"):
+                    continue
+                for d in reply.get("devices") or []:
+                    if d.get("udid") == self.id:
+                        self._sock, self._prefix = path, f"@{self.id} "
+                        pts = d.get("points")
+                        if isinstance(pts, list) and len(pts) == 2 and all(pts):
+                            self._points = (float(pts[0]), float(pts[1]))
+                        break
+                if self._sock is None and reply.get("udid") == self.id:
+                    self._sock = path
+                if self._sock:
+                    break
+        return self._sock  # type: ignore[return-value]
+
+    def daemon(self, line: str, timeout: float = 120) -> dict:
+        path = self.sock()
+        assert path
+        try:
+            reply = phoned_call(path, self._prefix + line, timeout)
+        except (OSError, ValueError) as e:
+            raise DeckError(f"phoned ({path}): {e}") from None
+        if not reply.get("ok"):
+            raise DeckError(f"phoned: {reply.get('error')}")
+        return reply
+
+    def pmd3(self, args: list[str], timeout: float = 90) -> subprocess.CompletedProcess:
+        exe = which("PYMOBILEDEVICE3", str(HERE / "venv/bin/pymobiledevice3"), "pymobiledevice3")
+        if not exe:
+            raise DeckError("phoned is not running for this device and pymobiledevice3 was not found; "
+                            "start the daemon (phone start) or install pymobiledevice3")
+        return run([exe, *args], timeout=timeout, env={"PYMOBILEDEVICE3_UDID": self.id})
+
+    def hid_norm(self, x: float, y: float) -> tuple[int, int]:
+        w, h = self.points()
+        if not (0 <= x <= w and 0 <= y <= h):
+            raise DeckError(f"point {fmt(x)},{fmt(y)} is outside the screen ({fmt(w)}x{fmt(h)} pt)")
+        return (max(0, min(self.HID_MAX, round(x * self.HID_MAX / w))),
+                max(0, min(self.HID_MAX, round(y * self.HID_MAX / h))))
+
+    def shot(self, path: Path) -> str:
+        if self.backend() == "wda":
+            self.wda.shot(path)
+        elif self.sock():
+            self.daemon("shot " + json.dumps(str(path)))
+        else:
+            self.pmd3(["developer", "core-device", "screen-capture", "screenshot", "--userspace", str(path)])
+        return "points = pixels / scale (deck info)"
+
+    def elements(self) -> list[str]:
+        if self.backend() == "wda":
+            return self.wda.elements() + ["# physical iOS via WebDriverAgent; coordinates in points"]
+        if self.sock():
+            items = self.daemon("elements", timeout=100).get("captions") or []
+        else:
+            out = self.pmd3(["developer", "accessibility", "list-items"], timeout=100).stdout
+            items = [e.get("caption") or e.get("spoken_description") or "" for e in json.loads(out or "[]")]
+        lines = [c for c in items if c]
+        lines.append("# physical iOS: accessibility captions only, no frames; use shot to find coordinates")
+        return lines
+
+    def tap(self, x: float, y: float) -> str:
+        if self.backend() == "wda":
+            self.wda.tap(x, y)
+            return "points"
+        nx, ny = self.hid_norm(x, y)
+        if self.sock():
+            self.daemon(f"tap {nx} {ny}")
+        else:
+            self.pmd3(["developer", "core-device", "universal-hid-service", "tap", "--userspace", "--", str(nx), str(ny)])
+        return "points"
+
+    def swipe(self, x1: float, y1: float, x2: float, y2: float, ms: int) -> str:
+        if self.backend() == "wda":
+            self.wda.swipe(x1, y1, x2, y2, ms)
+            return "points"
+        a, b = self.hid_norm(x1, y1)
+        c, d = self.hid_norm(x2, y2)
+        if self.sock():
+            self.daemon(f"drag {a} {b} {c} {d} {ms / 1000:.3f}")
+        else:
+            self.pmd3(["developer", "core-device", "universal-hid-service", "drag", "--userspace", "--",
+                       str(a), str(b), str(c), str(d)])
+        return "points"
+
+    def type_text(self, text: str) -> str:
+        if self.backend() == "wda":
+            self.wda.keys(text)
+            return f"typed {len(text)} characters"
+        ascii_only(text)
+        if self.sock():
+            self.daemon("type " + json.dumps(text))
+        else:
+            self.pmd3(["developer", "core-device", "universal-hid-service", "type", "--userspace", text])
+        return f"typed {len(text)} characters (hardware keyboard: the phone's keyboard layout applies)"
+
+    def key(self, name: str) -> str:
+        if self.backend() == "wda":
+            self.wda.key(name)
+            return f"pressed {name}"
+        if name in self.BUTTONS:
+            if self.sock():
+                self.daemon(f"button {name}")
+            else:
+                self.pmd3(["developer", "core-device", "hid", "button", "--userspace", name, "press"])
+            return f"pressed {name}"
+        if name in self.KEYS:
+            if self.sock():
+                self.daemon(f"key {name} 1")
+            else:
+                self.pmd3(["developer", "core-device", "universal-hid-service", "key", "--userspace", name])
+            return f"pressed {name}"
+        raise DeckError(f"unknown key {name!r} for ios; supported: {' '.join(self.BUTTONS + self.KEYS)}", EXIT_USAGE)
+
+    def launch(self, target: str) -> str:
+        if self.backend() == "wda":
+            self.wda.launch(target)
+            return f"launched {target}"
+        run(["xcrun", "devicectl", "device", "process", "launch", "--device", self.id,
+             "--terminate-existing", target, "-q"], timeout=60)
+        return f"launched {target}"
+
+    def apps(self, all_apps: bool) -> list[str]:
+        args = ["device", "info", "apps", "--device", self.id] + (["--include-all-apps"] if all_apps else [])
+        apps = devicectl_json(args).get("apps", [])
+        rows = sorted((a.get("bundleIdentifier", ""), a.get("name", ""), a.get("version", "")) for a in apps)
+        return [f"{b}  {n}  {v}".rstrip() for b, n, v in rows]
+
+    def info(self) -> list[tuple[str, str]]:
+        lines = ios_info_lines(self, self.display())
+        lines.insert(4, ("product type", self.product_type))
+        backend = self.backend()
+        lines.append(("backend", backend))
+        if backend == "wda":
+            ready = self.wda.status()
+            size = self.wda.window_size() if ready else None
+            if size:
+                lines.append(("wda points", f"{fmt(size[0])}x{fmt(size[1])} pt"))
+            lines.append(("wda", f"ready at {self.wda.url}" if ready else
+                          (f"not running; starts on the next command ({self.wda.url})" if self.wda.xctestrun()
+                           else f"not installed; run: deck {self.id} wda-setup")))
+        else:
+            lines.append(("phoned", self.sock() or "not running (direct pymobiledevice3 fallback, slower)"))
+        return lines
+
+    def wda_setup(self) -> str:
+        return self.wda.setup()
+
+    def wda_stop(self) -> str:
+        return self.wda.stop()
+
+
+def detect_ios() -> list[Device]:
+    if not shutil.which("xcrun"):
+        return []
+    try:
+        result = devicectl_json(["list", "devices"], timeout=30)
+    except DeckError:
+        return []
+    devices: list[Device] = []
+    for d in result.get("devices", []):
+        hw, dp, cp = d.get("hardwareProperties", {}), d.get("deviceProperties", {}), d.get("connectionProperties", {})
+        if hw.get("reality") == "simulated" or hw.get("platform") not in ("iOS", "iPadOS"):
+            continue
+        udid = hw.get("udid") or d.get("identifier")
+        state = cp.get("tunnelState") or "unknown"
+        dev = IOSDevice(udid, dp.get("name") or "", hw.get("marketingName") or hw.get("productType") or "",
+                        f"{hw.get('platform', 'iOS')} {dp.get('osVersionNumber', '?')}", state,
+                        product_type=hw.get("productType", ""))
+        devices.append(dev)
+    return devices
+
+
+# ---------------------------------------------------------------- iOS simulator
+
+
+class SimDevice(Device):
+    kind = "simulator"
+    BUTTONS = ("home", "lock", "side", "siri", "apple-pay")
+
+    def rocketsim(self) -> str:
+        exe = which("ROCKETSIM", "rocketsim", "/Applications/RocketSim.app/Contents/Resources/CLI/rocketsim",
+                    str(Path.home() / "Applications/RocketSim.app/Contents/Resources/CLI/rocketsim"))
+        if not exe:
+            raise DeckError("simulator elements and input need the RocketSim CLI: install RocketSim "
+                            "(https://www.rocketsim.app), then RocketSim > Settings > CLI & Agent > "
+                            "Install Command Line Tool")
+        return exe
+
+    def rs(self, args: list[str], timeout: float = 60, input: str | None = None) -> dict:
+        proc = run([self.rocketsim(), *args, "--udid", self.id], check=False, timeout=timeout, input=input)
+        try:
+            env = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            raise DeckError(f"rocketsim: {(proc.stderr or proc.stdout).strip()[-500:]}") from None
+        if not env.get("ok"):
+            err = env.get("error") or {}
+            hint = f" ({err['recovery_suggestion']})" if err.get("recovery_suggestion") else ""
+            raise DeckError(f"rocketsim: {err.get('code')}: {err.get('message')}{hint}")
+        return env.get("data") or {}
+
+    def shot(self, path: Path) -> str:
+        run(["xcrun", "simctl", "io", self.id, "screenshot", "--type=png", str(path)])
+        return "points = pixels / scale (deck info)"
+
+    def elements(self) -> list[str]:
+        lines: list[str] = []
+        for e in self.rs(["elements"]).get("elements", []):
+            (x, y), (w, h) = e.get("frame") or [[0, 0], [0, 0]]
+            lines.append(element_line(e.get("role", "?"), e.get("label"), e.get("value"),
+                                      e.get("identifier"), x, y, w, h, 1 if e.get("parentId") else 0))
+        lines.append("# simulator via RocketSim; coordinates in points")
+        return lines
+
+    def tap(self, x: float, y: float) -> str:
+        self.rs(["interact", "tap", fmt(x), fmt(y)])
+        return "points"
+
+    def swipe(self, x1: float, y1: float, x2: float, y2: float, ms: int) -> str:
+        self.rs(["interact", "swipe", "--from", f"{fmt(x1)},{fmt(y1)}", "--to", f"{fmt(x2)},{fmt(y2)}",
+                 "--duration", f"{max(ms, 50) / 1000:.2f}"])
+        return "points"
+
+    def type_text(self, text: str) -> str:
+        ascii_only(text)
+        self.rs(["interact", "type", "--stdin"], timeout=120, input=text)
+        return f"typed {len(text)} characters"
+
+    def key(self, name: str) -> str:
+        if name in self.BUTTONS:
+            self.rs(["interact", "button", name])
+        elif name == "enter":
+            self.rs(["interact", "type", "--stdin"], input="\n")
+        else:
+            raise DeckError(f"unknown key {name!r} for simulator; supported: {' '.join(self.BUTTONS)} enter",
+                            EXIT_USAGE)
+        return f"pressed {name}"
+
+    def launch(self, target: str) -> str:
+        run(["xcrun", "simctl", "launch", "--terminate-running-process", self.id, target])
+        return f"launched {target}"
+
+    def apps(self, all_apps: bool) -> list[str]:
+        raw = run(["xcrun", "simctl", "listapps", self.id]).stdout
+        data = json.loads(run(["plutil", "-convert", "json", "-o", "-", "-"], input=raw).stdout)
+        rows = []
+        for bundle, a in data.items():
+            if all_apps or a.get("ApplicationType") == "User":
+                rows.append(f"{bundle}  {a.get('CFBundleDisplayName') or a.get('CFBundleName') or ''}  "
+                            f"{a.get('CFBundleShortVersionString') or ''}".rstrip())
+        return sorted(rows)
+
+    def info(self) -> list[tuple[str, str]]:
+        lines = ios_info_lines(self, ios_display(self.id))
+        try:
+            lines.append(("control", self.rocketsim()))
+        except DeckError as e:
+            lines.append(("control", str(e)))
+        return lines
+
+
+def element_line(role, label, value, ident, x, y, w, h, depth=0) -> str:
+    parts = ["  " * min(depth, 6) + str(role or "?")]
+    if label:
+        parts.append(json.dumps(str(label), ensure_ascii=False))
+    if value not in (None, "") and value != label:
+        parts.append("=" + json.dumps(str(value), ensure_ascii=False))
+    if ident:
+        parts.append("#" + str(ident))
+    parts.append(f"@{fmt(x + w / 2)},{fmt(y + h / 2)} [{fmt(x)},{fmt(y)} {fmt(w)}x{fmt(h)}]")
+    return " ".join(parts)
+
+
+def detect_sims() -> list[Device]:
+    if not shutil.which("xcrun"):
+        return []
+    try:
+        data = json.loads(run(["xcrun", "simctl", "list", "devices", "booted", "-j"], timeout=30).stdout)
+    except (DeckError, json.JSONDecodeError):
+        return []
+    devices: list[Device] = []
+    for runtime, sims in data.get("devices", {}).items():
+        m = re.search(r"SimRuntime\.(\w+)-([\d-]+)", runtime)
+        os_name = f"{m.group(1)} {m.group(2).split('-')[0]}.{'.'.join(m.group(2).split('-')[1:])}".rstrip(".") if m else runtime
+        for s in sims:
+            model = s.get("deviceTypeIdentifier", "").rsplit(".", 1)[-1].replace("-", " ")
+            devices.append(SimDevice(s["udid"], s.get("name", ""), model, os_name, s.get("state", "").lower()))
+    return devices
+
+
+# ---------------------------------------------------------------- Android
+
+
+class AndroidDevice(Device):
+    kind = "android"
+    KEYS = {"home": "KEYCODE_HOME", "back": "KEYCODE_BACK", "enter": "KEYCODE_ENTER", "backspace": "KEYCODE_DEL",
+            "tab": "KEYCODE_TAB", "escape": "KEYCODE_ESCAPE", "up": "KEYCODE_DPAD_UP", "down": "KEYCODE_DPAD_DOWN",
+            "left": "KEYCODE_DPAD_LEFT", "right": "KEYCODE_DPAD_RIGHT", "menu": "KEYCODE_MENU",
+            "power": "KEYCODE_POWER", "volume-up": "KEYCODE_VOLUME_UP", "volume-down": "KEYCODE_VOLUME_DOWN",
+            "app-switch": "KEYCODE_APP_SWITCH", "search": "KEYCODE_SEARCH"}
+
+    def adb(self, args: list[str], **kw) -> subprocess.CompletedProcess:
+        return run([adb_path(), "-s", self.id, *args], **kw)
+
+    def sh(self, cmd: str, **kw) -> str:
+        return self.adb(["shell", cmd], **kw).stdout
+
+    def shot(self, path: Path) -> str:
+        data = self.adb(["exec-out", "screencap", "-p"], text=False).stdout
+        if not data.startswith(b"\x89PNG"):
+            raise DeckError("screencap did not return a PNG")
+        path.write_bytes(data)
+        return "tap units are these pixels"
+
+    def elements(self) -> list[str]:
+        remote = "/data/local/tmp/deck-ui.xml"
+        self.sh(f"uiautomator dump {remote} >/dev/null", timeout=60)
+        xml = self.adb(["exec-out", "cat", remote]).stdout
+        self.sh(f"rm -f {remote}", check=False)
+        lines: list[str] = []
+        walk_android(ET.fromstring(xml), 0, lines)
+        lines.append("# android via uiautomator; coordinates in pixels")
+        return lines
+
+    def tap(self, x: float, y: float) -> str:
+        self.sh(f"input tap {fmt(x)} {fmt(y)}")
+        return "pixels"
+
+    def swipe(self, x1: float, y1: float, x2: float, y2: float, ms: int) -> str:
+        self.sh(f"input swipe {fmt(x1)} {fmt(y1)} {fmt(x2)} {fmt(y2)} {ms}")
+        return "pixels"
+
+    def type_text(self, text: str) -> str:
+        ascii_only(text)
+        for i, chunk in enumerate(text.split("\n")):
+            if i:
+                self.sh("input keyevent KEYCODE_ENTER")
+            if chunk:
+                self.sh("input text " + shlex.quote(chunk.replace(" ", "%s")))
+        return f"typed {len(text)} characters"
+
+    def key(self, name: str) -> str:
+        code = self.KEYS.get(name) or (name if re.fullmatch(r"KEYCODE_[A-Z0-9_]+|\d+", name) else None)
+        if not code:
+            raise DeckError(f"unknown key {name!r} for android; supported: {' '.join(self.KEYS)}, "
+                            "KEYCODE_* or a number", EXIT_USAGE)
+        self.sh(f"input keyevent {code}")
+        return f"pressed {name}"
+
+    def launch(self, target: str) -> str:
+        if not re.fullmatch(r"[\w.]+(/[\w.$]+)?", target):
+            raise DeckError(f"not a package or package/activity: {target!r}", EXIT_USAGE)
+        if "/" in target:
+            out = self.sh(f"am start -n {target}")
+        else:
+            out = self.sh(f"monkey -p {target} -c android.intent.category.LAUNCHER 1")
+        if "Error" in out or "No activities found" in out or "aborted" in out:
+            raise DeckError(out.strip())
+        return f"launched {target}"
+
+    def apps(self, all_apps: bool) -> list[str]:
+        out = self.sh("pm list packages" + ("" if all_apps else " -3"))
+        return sorted(line.split(":", 1)[1] for line in out.splitlines() if line.startswith("package:"))
+
+    def info(self) -> list[tuple[str, str]]:
+        size = re.findall(r"(\d+)x(\d+)", self.sh("wm size"))
+        dens = re.findall(r"(\d+)", self.sh("wm density"))
+        lines = [("id", self.id), ("kind", self.kind), ("name", self.name), ("model", self.model),
+                 ("os", self.os), ("state", self.state), ("physical", "yes" if self.physical else "no (emulator)")]
+        if size:
+            w, h = size[-1]
+            lines.append(("screen", f"{w}x{h} px"))
+        if dens:
+            d = int(dens[-1])
+            lines += [("density", f"{d} dpi"), ("scale", fmt(d / 160) if d % 160 else str(d // 160)),
+                      ("points", f"{fmt(int(size[-1][0]) * 160 / d)}x{fmt(int(size[-1][1]) * 160 / d)} dp" if size else "?")]
+        lines.append(("tap units", "pixels"))
+        lines.append(("input", "allowed" if self.input_allowed else "locked (see deck --help)"))
+        return lines
+
+
+def walk_android(node: ET.Element, depth: int, lines: list[str]) -> None:
+    for child in node:
+        a = child.attrib
+        text, desc, rid = a.get("text", ""), a.get("content-desc", ""), a.get("resource-id", "")
+        clickable = a.get("clickable") == "true"
+        if text or desc or rid or clickable:
+            m = [int(v) for v in re.findall(r"-?\d+", a.get("bounds", ""))]
+            if len(m) == 4:
+                x1, y1, x2, y2 = m
+                role = a.get("class", "?").rsplit(".", 1)[-1] + (" (clickable)" if clickable else "")
+                lines.append(element_line(role, text or desc, desc if text and desc else None,
+                                          rid.split(":id/")[-1] if rid else None,
+                                          x1, y1, x2 - x1, y2 - y1, depth))
+        walk_android(child, depth + 1, lines)
+
+
+def adb_path() -> str:
+    exe = which("ADB", "adb")
+    if not exe:
+        sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT") or str(Path.home() / "Library/Android/sdk")
+        cand = Path(sdk) / "platform-tools/adb"
+        if cand.exists():
+            return str(cand)
+        raise DeckError("adb not found (install Android platform-tools)")
+    return exe
+
+
+def detect_android() -> list[Device]:
+    try:
+        exe = adb_path()
+        out = run([exe, "devices", "-l"], timeout=20).stdout
+    except DeckError:
+        return []
+    devices: list[Device] = []
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        serial, state = parts[0], parts[1]
+        model = next((p.split(":", 1)[1] for p in parts if p.startswith("model:")), "")
+        dev = AndroidDevice(serial, "", model, "Android", state)
+        dev.physical = not serial.startswith("emulator-")
+        if state == "device":
+            props = run([exe, "-s", serial, "shell",
+                         "getprop ro.product.model; getprop ro.build.version.release; getprop ro.boot.qemu.avd_name; "
+                         "getprop ro.kernel.qemu; getprop ro.boot.qemu; settings get global device_name"],
+                        check=False, timeout=15).stdout.splitlines() + [""] * 6
+            pmodel, release, avd, kq, bq, dname = (p.strip() for p in props[:6])
+            dev.model = pmodel or model
+            dev.os = f"Android {release}" if release else "Android"
+            dev.physical = not (serial.startswith("emulator-") or kq == "1" or bq == "1")
+            dev.name = avd or (dname if dname and dname != "null" else "") or dev.model
+        else:
+            dev.name = model or serial
+        devices.append(dev)
+    return devices
+
+
+# ---------------------------------------------------------------- discovery + selection
+
+KIND_RANK = {"ios": 0, "simulator": 1, "android": 2}
+
+
+def discover() -> list[Device]:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(f) for f in (detect_ios, detect_sims, detect_android)]
+        devices = [d for f in futures for d in f.result()]
+    config = load_config()
+    for d in devices:
+        c = config.get(d.id)
+        if c and c.get("kind") in (None, d.kind):
+            if c.get("name"):
+                d.name = str(c["name"])
+            d.hidden = bool(c.get("hidden", False))
+            d.order = int(c.get("order") or 0)
+            d.allow_input = c.get("allowInput") is not False
+            d.config = c
+    devices.sort(key=lambda d: (d.order, KIND_RANK.get(d.kind, 9), not d.usable, d.name.lower()))
+    return devices
+
+
+def select(devices: list[Device], selector: str | None) -> Device:
+    if selector is None:
+        pool = [d for d in devices if d.usable]
+        if len(pool) == 1:
+            return pool[0]
+        if not pool:
+            raise DeckError("no connected device; run: deck list", EXIT_USAGE)
+        raise DeckError("several devices are connected; name one:\n" + table(pool), EXIT_USAGE)
+    for d in devices:
+        if d.id.lower() == selector.lower():
+            return d
+    s = selector.lower()
+    exact = [d for d in devices if d.name.lower() == s]
+    if len(exact) == 1:
+        return exact[0]
+    matches = exact or [d for d in devices if s in d.name.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise DeckError(f"no device matches {selector!r}; run: deck list", EXIT_USAGE)
+    raise DeckError(f"{selector!r} is ambiguous:\n" + table(matches), EXIT_USAGE)
+
+
+def table(devices: list[Device]) -> str:
+    rows = [("ID", "KIND", "NAME", "MODEL", "OS", "STATE", "INPUT")]
+    for d in devices:
+        rows.append((d.id, d.kind, d.name + (" (hidden)" if d.hidden else ""), d.model, d.os, d.state,
+                     "yes" if d.input_allowed else "locked"))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    return "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in rows)
+
+
+# ---------------------------------------------------------------- main
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE, end="")
+        return 0 if argv else EXIT_USAGE
+    if argv[0] == "list":
+        flags = set(argv[1:])
+        if flags - {"--all", "--json"}:
+            raise DeckError(f"unknown option for list: {' '.join(sorted(flags - {'--all', '--json'}))}", EXIT_USAGE)
+        devices = discover()
+        if "--json" in flags:
+            print(json.dumps([d.as_dict() for d in devices], indent=2, ensure_ascii=False))
+        elif devices:
+            print(table(devices))
+        else:
+            print("no devices found (checked devicectl, simctl booted, adb)")
+        return 0
+
+    if argv[0] in COMMANDS:
+        selector, cmd, args = None, argv[0], argv[1:]
+    elif len(argv) >= 2 and argv[1] in COMMANDS:
+        selector, cmd, args = argv[0], argv[1], argv[2:]
+    else:
+        raise DeckError(f"unknown command: {' '.join(argv[:2])}\n\n{USAGE}", EXIT_USAGE)
+
+    def need(n: int, upto: int | None = None, usage: str = "") -> None:
+        if not (n <= len(args) <= (upto if upto is not None else n)):
+            raise DeckError(f"usage: deck [<dev>] {cmd} {usage}".rstrip(), EXIT_USAGE)
+
+    # Validate arguments before touching any device.
+    if cmd == "shot":
+        need(1, usage="<file.png>")
+    elif cmd == "tap":
+        need(2, usage="<x> <y>")
+        x, y = (num(a, "coordinate") for a in args)
+    elif cmd == "swipe":
+        need(4, 5, "<x1> <y1> <x2> <y2> [ms]")
+        coords = [num(a, "coordinate") for a in args[:4]]
+        ms = int(num(args[4], "ms")) if len(args) == 5 else 300
+        if ms < 0:
+            raise DeckError("ms must be >= 0", EXIT_USAGE)
+    elif cmd == "type":
+        if not args:
+            raise DeckError("usage: deck [<dev>] type <text>", EXIT_USAGE)
+        text = " ".join(args)
+    elif cmd in ("key", "launch"):
+        need(1, usage="<name>" if cmd == "key" else "<bundle id | package>")
+    elif cmd == "apps":
+        need(0, 1, "[--all]")
+        if args and args[0] != "--all":
+            raise DeckError("usage: deck [<dev>] apps [--all]", EXIT_USAGE)
+    else:
+        need(0)
+
+    dev = select(discover(), selector)
+    if not dev.usable and cmd != "wda-stop":
+        raise DeckError(f"{dev.name} ({dev.id}) is {dev.state}, not connected")
+    if cmd in GUARDED_COMMANDS and not dev.input_allowed:
+        why = ("its config entry has \"allowInput\": false" if not dev.allow_input
+               else "DEVICEDECK_LOCK_PHYSICAL_INPUT=1 locks physical devices")
+        raise DeckError(f"refused: input to {dev.name} ({dev.id}) is locked because {why}. "
+                        f"Only the device owner can unlock it.", EXIT_GUARD)
+
+    if cmd == "shot":
+        path = Path(args[0]).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        note = dev.shot(path)
+        size = png_size(path)
+        print(f"{path}  {size[0]}x{size[1]} px  ({note})" if size else str(path))
+    elif cmd == "elements":
+        print("\n".join(dev.elements()))
+    elif cmd == "tap":
+        unit = dev.tap(x, y)
+        print(f"tapped {fmt(x)},{fmt(y)} ({unit}) on {dev.name}")
+    elif cmd == "swipe":
+        unit = dev.swipe(*coords, ms)
+        print(f"swiped {fmt(coords[0])},{fmt(coords[1])} -> {fmt(coords[2])},{fmt(coords[3])} in {ms} ms ({unit}) on {dev.name}")
+    elif cmd == "type":
+        print(dev.type_text(text))
+    elif cmd == "key":
+        print(dev.key(args[0].lower() if not args[0].startswith("KEYCODE_") else args[0]))
+    elif cmd == "launch":
+        print(dev.launch(args[0]))
+    elif cmd == "apps":
+        rows = dev.apps(bool(args))
+        print("\n".join(rows) if rows else "no apps")
+    elif cmd in ("wda-setup", "wda-stop"):
+        if not isinstance(dev, IOSDevice):
+            raise DeckError(f"{cmd} is only for physical iPhones, not {dev.kind} devices", EXIT_USAGE)
+        print(dev.wda_setup() if cmd == "wda-setup" else dev.wda_stop())
+    elif cmd == "info":
+        lines = dev.info()
+        width = max(len(k) for k, _ in lines)
+        print("\n".join(f"{k.ljust(width)}  {v}" for k, v in lines))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except DeckError as e:
+        print(f"deck: {e}", file=sys.stderr)
+        sys.exit(e.code)
+    except KeyboardInterrupt:
+        sys.exit(130)

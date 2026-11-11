@@ -1,0 +1,33 @@
+{
+  "devices": [
+    {
+      "id": "00008110-0000000000000001",
+      "kind": "ios",
+      "name": "Personal iPhone",
+      "hidden": false,
+      "order": 0,
+      "allowInput": false
+    },
+    {
+      "id": "00008120-0000000000000002",
+      "kind": "ios",
+      "name": "Test iPhone",
+      "hidden": false,
+      "order": 1
+    },
+    {
+      "id": "11111111-2222-3333-4444-555555555555",
+      "kind": "simulator",
+      "name": "iPhone 17 simulator",
+      "hidden": false,
+      "order": 2
+    },
+    {
+      "id": "emulator-5554",
+      "kind": "android",
+      "name": "Pixel emulator",
+      "hidden": true,
+      "order": 3
+    }
+  ]
+}

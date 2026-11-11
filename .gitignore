@@ -1,0 +1,44 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
+
+# Build outputs
+*.app/
+build/
+DerivedData/
+*.xctestrun
+*.xcresult/
+
+# Logs and runtime state
+*.log
+*.sock
+run/
+tmp/
+
+# Local, per-machine configuration (device ids, names, signing)
+devices.json
+config.local.*
+.env
+.env.*
+!.env.example
+!devices.example.json
+
+# Device screenshots and captured frames (can contain private data)
+*.png
+*.jpg
+*.jpeg
+!docs/**/*.png
+
+# Signing material
+*.mobileprovision
+*.p12
+*.cer
+*.certSigningRequest
+
+# WebDriverAgent checkout, if cloned into the repo
+WebDriverAgent/

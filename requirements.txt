@@ -1,0 +1,5 @@
+# devicedeck Python dependencies (Python >= 3.11, tested with 3.13).
+# pymobiledevice3 is pinned exactly: phoned.py uses its private internals,
+# so a newer release can break the daemon. Test before you upgrade it.
+pymobiledevice3==11.45.0
+pillow==13.0.0

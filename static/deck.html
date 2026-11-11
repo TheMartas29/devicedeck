@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>devicedeck</title>
+<link rel="icon" type="image/png" href="/logo.png">
+<link rel="stylesheet" href="/deck.css">
+</head>
+<body>
+<main id="deck" aria-label="Devices"></main>
+<p id="empty" hidden>No devices to show. Connect an iPhone, boot a simulator or start an Android emulator.<br>
+Devices hidden in the device list (gear, top right) stay hidden.</p>
+<div id="drop-mark" hidden></div>
+<button id="gear" type="button" title="Device list" aria-label="Device list" aria-expanded="false" aria-controls="panel">
+ <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.6 7.6 0 0 0 0-2l2.1-1.6a.5.5 0 0 0 .1-.6l-2-3.5a.5.5 0 0 0-.6-.2l-2.5 1a7.4 7.4 0 0 0-1.7-1l-.4-2.6a.5.5 0 0 0-.5-.5h-4a.5.5 0 0 0-.5.4l-.4 2.7a7.4 7.4 0 0 0-1.7 1l-2.5-1a.5.5 0 0 0-.6.2l-2 3.5a.5.5 0 0 0 .1.6L4.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6a.5.5 0 0 0-.1.6l2 3.5c.1.2.4.3.6.2l2.5-1c.5.4 1.1.7 1.7 1l.4 2.6c0 .3.2.5.5.5h4c.3 0 .5-.2.5-.4l.4-2.7c.6-.3 1.2-.6 1.7-1l2.5 1c.2.1.5 0 .6-.2l2-3.5a.5.5 0 0 0-.1-.6L19.4 13zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/></svg>
+</button>
+<section id="panel" hidden aria-label="Device list">
+ <header><h2>Devices</h2><button id="panel-close" type="button" aria-label="Close">×</button></header>
+ <p class="hint">Shown devices appear side by side in this order. Drag a device by its name to move it.</p>
+ <ol id="list"></ol>
+ <p id="status" role="status"></p>
+</section>
+<script src="/deck.js"></script>
+</body>
+</html>

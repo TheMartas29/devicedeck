@@ -1,0 +1,10 @@
+{
+  "name": "devicedeck",
+  "displayName": "devicedeck",
+  "version": "0.1.0",
+  "description": "See and control physical iPhones, iOS simulators and Android devices with the deck CLI, while you watch them side by side on a local preview page.",
+  "author": {
+    "name": "Roman Martínek"
+  },
+  "keywords": ["ios", "iphone", "simulator", "android", "device", "automation", "screenshot"]
+}

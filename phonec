@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+import json
+import os
+import socket
+import sys
+
+# Client for the phoned socket. Stdlib only.
+RUNTIME = os.path.expanduser(os.environ.get("DEVICEDECK_RUNTIME_DIR") or "~/Library/Caches/devicedeck")
+SOCKET = os.path.expanduser(os.environ.get("DEVICEDECK_SOCK") or os.environ.get("PHONED_SOCK")
+                            or os.path.join(RUNTIME, "phoned.sock"))
+TIMEOUT = float(os.environ.get("DEVICEDECK_TIMEOUT") or os.environ.get("PHONEC_TIMEOUT") or "120")
+UDID = os.environ.get("DEVICEDECK_UDID") or os.environ.get("PHONE_UDID") or ""
+USAGE = """usage: phonec [--udid UDID|NAME] COMMAND [ARGS]
+  --udid picks the iPhone when several are connected (env DEVICEDECK_UDID, alias PHONE_UDID)
+  ping | devices | quit | restart | elements
+  tap X Y                         (0..65535)
+  drag X1 Y1 X2 Y2 [DURATION [STEPS]]
+  type TEXT
+  key NAME [COUNT]                backspace|enter|escape|tab|left|right|up|down
+  button NAME                     home|lock|volume-up|volume-down|mute|siri
+  shot [PATH]"""
+
+
+def build_line(argv: list[str]) -> str:
+    cmd, args = argv[0], argv[1:]
+    if cmd == "type":
+        return "type " + json.dumps(" ".join(args))
+    if cmd == "shot" and args:
+        return "shot " + json.dumps(os.path.abspath(args[0]))
+    return " ".join(argv)
+
+
+def main() -> int:
+    argv, udid = sys.argv[1:], UDID
+    if len(argv) >= 2 and argv[0] == "--udid":
+        udid, argv = argv[1], argv[2:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    line = build_line(argv)
+    if udid:
+        line = f"@{udid} {line}"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(TIMEOUT)
+    try:
+        sock.connect(SOCKET)
+    except OSError:
+        print(json.dumps({"ok": False, "error": f"phoned is not running ({SOCKET})"}))
+        return 2
+    try:
+        sock.sendall(line.encode() + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    except socket.timeout:
+        print(json.dumps({"ok": False, "error": "timed out waiting for phoned"}))
+        return 1
+    finally:
+        sock.close()
+    reply = buf.decode().strip()
+    print(reply)
+    try:
+        return 0 if json.loads(reply).get("ok") else 1
+    except json.JSONDecodeError:
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
