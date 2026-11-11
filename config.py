@@ -9,8 +9,13 @@ $XDG_CONFIG_HOME/devicedeck/devices.json (~/.config/devicedeck/devices.json):
                   "name": "<display name or null>", "hidden": false, "order": 0}]}
 
 Detection fills in everything else (model, OS, size, connection). Keys this module does not
-know (for example "allowInput", which the deck CLI reads) are kept as they are when the page
-saves, and the page cannot set them. Stdlib only.
+know (for example "allowInput") are kept as they are when the page saves, and the page cannot
+set them; entries the page leaves out are kept too. While the file does not load, saving is
+refused (ConfigUnreadable) instead of overwriting it.
+
+input_lock() tells whether input to a device is refused: "allowInput" set to anything but
+true in an entry whose id matches (any kind, case-insensitive), an unreadable file, or
+DEVICEDECK_LOCK_PHYSICAL_INPUT=1 for a physical device. phoned enforces it. Stdlib only.
 """
 import json
 import logging
@@ -24,6 +29,12 @@ KINDS = ("ios", "simulator", "android")
 MAX_ID = 200
 MAX_NAME = 100
 MAX_DEVICES = 200
+MANAGED_KEYS = ("id", "kind", "name", "hidden", "order")
+ALLOW_VALUES = (True, 1, "true", "yes", "1", "on")
+
+
+class ConfigUnreadable(Exception):
+    """The device list file exists but does not load; saving over it would lose it."""
 
 
 def env(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -64,6 +75,8 @@ def normalize(data: Any) -> list[dict[str, Any]]:
         dev_id, kind = item.get("id"), item.get("kind")
         if not isinstance(dev_id, str) or not dev_id.strip() or len(dev_id) > MAX_ID:
             raise ValueError(f"device {i}: bad id")
+        if isinstance(kind, str):
+            kind = kind.strip().lower()
         if kind not in KINDS:
             raise ValueError(f"device {i}: kind must be one of {', '.join(KINDS)}")
         name = item.get("name")
@@ -88,42 +101,95 @@ def normalize(data: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _load_raw() -> Optional[dict[str, Any]]:
+    """The file as JSON, None when it is missing. Raises ConfigUnreadable when it does not load."""
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+        normalize(data)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise ConfigUnreadable(f"{CONFIG_PATH} does not load: {e}") from None
+    return data
+
+
+def config_error() -> Optional[str]:
+    """Why the device list file does not load, or None when it loads or is missing."""
+    try:
+        _load_raw()
+    except ConfigUnreadable as e:
+        return str(e)
+    return None
+
+
 def load_devices() -> list[dict[str, Any]]:
     """The saved device list; empty when the file is missing or broken (a broken file is logged)."""
     try:
-        return normalize(json.loads(CONFIG_PATH.read_text()))
-    except FileNotFoundError:
+        data = _load_raw()
+    except ConfigUnreadable as e:
+        logger.warning("ignoring the device list: %s", e)
         return []
-    except (OSError, ValueError) as e:
-        logger.warning("ignoring %s: %s", CONFIG_PATH, e)
-        return []
+    return normalize(data) if data is not None else []
 
 
-def _read_raw() -> dict[str, Any]:
+def _allows(value: Any) -> bool:
+    if isinstance(value, str):
+        value = value.strip().lower()
+    return any(value is v or (type(value) is type(v) and value == v) for v in ALLOW_VALUES)
+
+
+def input_lock(device_id: str, physical: bool = True) -> Optional[str]:
+    """None when input to the device is allowed, else why not: "config" (an entry with this id,
+    any kind, compared case-insensitively, has "allowInput" set to anything but true, 1, "true",
+    "yes", "on"), "config unreadable" (the file exists but does not load) or "env"
+    (DEVICEDECK_LOCK_PHYSICAL_INPUT=1 and the device is physical). Reads the raw file, so keys
+    normalize() drops still count."""
     try:
-        data = json.loads(CONFIG_PATH.read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        raw = _load_raw()
+    except ConfigUnreadable:
+        return "config unreadable"
+    wanted = device_id.strip().casefold()
+    for item in (raw or {}).get("devices") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            continue
+        if item["id"].strip().casefold() == wanted and "allowInput" in item and not _allows(item["allowInput"]):
+            return "config"
+    if physical and os.environ.get("DEVICEDECK_LOCK_PHYSICAL_INPUT", "").strip() == "1":
+        return "env"
+    return None
+
+
+def _entry_key(item: dict[str, Any]) -> tuple[str, str]:
+    return str(item.get("kind") or "").strip().lower(), str(item.get("id") or "").strip().casefold()
 
 
 def save_devices(data: Any) -> list[dict[str, Any]]:
     """Validate and write the device list atomically (mode 0600). Returns what was saved.
 
-    Unknown keys already in the file, top-level and per device, are carried over."""
+    Keys the page does not manage, top-level and per device, are carried over from the file,
+    and file entries missing from `data` are kept after the others. Raises ValueError for bad
+    data and ConfigUnreadable when the current file does not load."""
     devices = normalize(data)
-    raw = _read_raw()
-    extras = {}
-    for item in raw.get("devices") or []:
-        if isinstance(item, dict) and isinstance(item.get("id"), str):
-            extra = {k: v for k, v in item.items() if k not in ("id", "kind", "name", "hidden", "order")}
-            extras[(item.get("kind"), item["id"].strip())] = extra
-            extras.setdefault((None, item["id"].strip()), extra)
+    raw = _load_raw() or {}
+    old_items = [item for item in raw.get("devices") or [] if isinstance(item, dict)]
+    by_key = {_entry_key(item): item for item in old_items}
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in old_items:
+        by_id.setdefault(_entry_key(item)[1], item)
+    used: set[int] = set()
     for item in devices:
-        extra = extras.get((item["kind"], item["id"])) or extras.get((None, item["id"])) or {}
-        item.update({k: v for k, v in extra.items() if k not in item})
+        old = by_key.get(_entry_key(item)) or by_id.get(_entry_key(item)[1])
+        if old is None:
+            continue
+        used.add(id(old))
+        item.update({k: v for k, v in old.items() if k not in MANAGED_KEYS})
+    kept = [dict(item) for item in old_items if id(item) not in used]
+    if len(devices) + len(kept) > MAX_DEVICES:
+        raise ValueError(f"at most {MAX_DEVICES} devices")
+    for i, item in enumerate(kept, start=len(devices)):
+        item["order"] = i
     out = {k: v for k, v in raw.items() if k != "devices"}
-    out["devices"] = devices
+    out["devices"] = devices + kept
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

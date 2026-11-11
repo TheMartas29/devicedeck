@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """One physical iPhone: holds its CoreDevice tunnel and media stream and takes CLI commands.
 
 pymobiledevice3 allows one userspace tunnel per process, so phoned.py starts one worker per
@@ -9,6 +8,7 @@ connected iPhone. A worker listens on two private Unix sockets in the runtime di
   video from. phoned passes on only the read-only stream paths, never the input ones.
   Before iOS 27 the phone has no media stream (error 9021); the socket then serves
   GET /stream.mjpg instead, built from screenshots taken only while a page watches.
+Both modes hold a power assertion that keeps the phone from auto-locking while connected.
 Run it with the venv's python; phoned does that.
 """
 import argparse
@@ -63,6 +63,7 @@ from pymobiledevice3.remote.core_device.screen_stream import (
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.remote.userspace_tunnel import UserspaceRsdTunnel
 from pymobiledevice3.services.accessibilityaudit import AccessibilityAudit
+from pymobiledevice3.services.power_assertion import PowerAssertionService
 
 import side_panels
 
@@ -94,6 +95,8 @@ STREAM_UNSUPPORTED = 9021  # CoreDeviceError code: "Remote control requires iOS 
 SHOT_INTERVAL = 0.5  # shortest time between two preview screenshots (one takes ~1.5 s)
 SHOT_REDUCE = 2
 SHOT_QUALITY = 80
+AWAKE_TIMEOUT = 300
+AWAKE_REFRESH = 120
 
 logger = logging.getLogger("ios_worker")
 
@@ -146,6 +149,28 @@ async def _cancel(task: Optional[asyncio.Task[Any]]) -> None:
         await task
 
 
+async def _keep_awake(rsd: RemoteServiceDiscoveryService) -> None:
+    """Renew a PreventUserIdleSystemSleep assertion every AWAKE_REFRESH s, like the stream
+    server's own loop, but logging whether it works."""
+    working: Optional[bool] = None
+    while True:
+        try:
+            async with PowerAssertionService(rsd).create_power_assertion(
+                    "PreventUserIdleSystemSleep", "devicedeck", AWAKE_TIMEOUT,
+                    "devicedeck keeping the phone awake for the preview"):
+                pass
+            if working is not True:
+                logger.info("keep-awake assertion held")
+            working = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if working is not False:
+                logger.warning("keep-awake assertion failed (the phone may auto-lock): %s", e)
+            working = False
+        await asyncio.sleep(AWAKE_REFRESH)
+
+
 class Session:
     def __init__(self, udid: str, http_socket: Path, screenshots: bool = False) -> None:
         self.udid = udid
@@ -162,6 +187,7 @@ class Session:
         self._sink: Optional[asyncio.Queue[bytes]] = None
         self._last_start_attempt = 0.0
         self._shot_lock = asyncio.Lock()
+        self._frame_writers: set[asyncio.StreamWriter] = set()
 
     async def open(self) -> None:
         self.tunnel = UserspaceRsdTunnel(serial=self.udid)
@@ -171,6 +197,7 @@ class Session:
             self.screenshots = True
             self.frames = side_panels.Frames(self._poll)
             logger.info("no media stream on this phone; the preview polls screenshots")
+            self._tasks = [asyncio.create_task(_keep_awake(self.rsd))]
             await self._listen(self._serve_frames)
             return
         server = StreamHost(
@@ -228,6 +255,7 @@ class Session:
 
     async def _serve_frames(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self.frames is not None
+        self._frame_writers.add(writer)
         try:
             request = (await reader.readline()).split()
             while (await reader.readline()) not in (b"\r\n", b"\n", b""):
@@ -236,9 +264,10 @@ class Session:
                 await self.frames.stream(writer, side_panels.SidePanels._stream_head(None))
             else:
                 side_panels.SidePanels._reply(writer, 404, b"not found")
-        except ConnectionError:
+        except (ConnectionError, ValueError):
             pass
         finally:
+            self._frame_writers.discard(writer)
             writer.close()
 
     async def _drain_sink(self) -> None:
@@ -271,11 +300,19 @@ class Session:
                     server._reconnect_signal.set()
 
     async def close(self) -> None:
+        """Release everything; never raises (the supervisor reconnects right after)."""
+        try:
+            await self._close()
+        except Exception:
+            logger.warning("session close failed", exc_info=True)
+
+    async def _close(self) -> None:
         server = self.server
         if self.http is not None:
             self.http.close()
-            if self.frames is not None:
-                self.http.close_clients()
+            for writer in list(self._frame_writers):
+                with contextlib.suppress(Exception):
+                    writer.close()
         if self.frames is not None:
             await self.frames.close()
         for task in self._tasks:
@@ -406,39 +443,54 @@ class Daemon:
         return self.stop.is_set()
 
     async def _supervise(self) -> None:
+        """Connect, watch, reconnect until stop; an unexpected error only delays the next try."""
         delay = 2.0
         while not self.stop.is_set():
-            session = Session(self.udid, self.http_socket, self.screenshots)
-            opening = asyncio.create_task(session.open())
-            stopping = asyncio.create_task(self.stop.wait())
-            await asyncio.wait({opening, stopping}, return_when=asyncio.FIRST_COMPLETED)
-            stopping.cancel()
-            if not opening.done():
-                await _cancel(opening)
-                await session.close()
+            try:
+                connected = await self._connect_once(delay)
+            except Exception as e:
+                logger.exception("session failed")
+                self.last_error = f"session failed: {e}"
+                connected = False
+            if connected is None:
                 return
-            if opening.exception() is not None:
-                self.last_error = f"connect failed: {opening.exception()}"
-                logger.warning("%s; retrying in %.0fs", self.last_error, delay)
-                await session.close()
+            if connected:
+                delay = 2.0
+            else:
                 if await self._wait_stop(delay):
                     return
                 delay = min(delay * 2, 30.0)
-                continue
-            delay = 2.0
-            self.last_error = None
-            if session.rsd is not None:
-                self.product_type = session.rsd.product_type
-                self.product_version = session.rsd.product_version
-            self.rebuild.clear()
-            self.session = session
-            self.ready.set()
-            try:
-                await self._monitor(session)
-            finally:
-                self.ready.clear()
-                self.session = None
-                await session.close()
+
+    async def _connect_once(self, delay: float) -> Optional[bool]:
+        """One session: True after it ran and ended, False when it did not connect, None on stop."""
+        session = Session(self.udid, self.http_socket, self.screenshots)
+        opening = asyncio.create_task(session.open())
+        stopping = asyncio.create_task(self.stop.wait())
+        await asyncio.wait({opening, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        stopping.cancel()
+        if not opening.done():
+            await _cancel(opening)
+            await session.close()
+            return None
+        if opening.exception() is not None:
+            self.last_error = f"connect failed: {opening.exception()}"
+            logger.warning("%s; retrying in %.0fs", self.last_error, delay)
+            await session.close()
+            return False
+        self.last_error = None
+        if session.rsd is not None:
+            self.product_type = session.rsd.product_type
+            self.product_version = session.rsd.product_version
+        self.rebuild.clear()
+        self.session = session
+        self.ready.set()
+        try:
+            await self._monitor(session)
+        finally:
+            self.ready.clear()
+            self.session = None
+            await session.close()
+        return True
 
     async def _monitor(self, session: Session) -> None:
         while not self.stop.is_set():

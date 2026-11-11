@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """devicedeck daemon (hub). Run it with the venv's python: `venv/bin/python phoned.py --preview`.
 
 - Finds connected physical iPhones (usbmux, USB or network, plus `xcrun devicectl list devices`)
@@ -10,10 +9,14 @@
   the right worker. A line may start with `@<udid>` (or `@<name>`) to pick the iPhone; without
   it the target is --udid / DEVICEDECK_UDID, else the only connected iPhone.
   `ping` and `devices` are answered here, `quit` stops everything.
+- Refuses the input commands (INPUT_COMMANDS) to an iPhone whose input is locked
+  (config.input_lock: "allowInput" in devices.json, DEVICEDECK_LOCK_PHYSICAL_INPUT=1).
+- Serves on loopback only; --bind takes only a loopback address.
 """
 import argparse
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -39,10 +42,25 @@ MISSING_ROUNDS = 2  # a device must be missing this many rounds in a row before 
 WORKER_STOP_SECS = 20.0
 REQUEST_TIMEOUT = 115.0
 LINE_LIMIT = 64 * 1024 * 1024
+LOG_ROTATE_BYTES = 5 * 1024 * 1024
+INPUT_COMMANDS = {"tap", "drag", "type", "key", "button", "launch"}
 
 
 class CommandError(Exception):
     pass
+
+
+class InputLocked(CommandError):
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+async def _reap(proc: asyncio.subprocess.Process) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        await asyncio.shield(proc.wait())
 
 
 async def _run(*args: str, timeout: float = 20.0) -> tuple[int, bytes]:
@@ -50,8 +68,8 @@ async def _run(*args: str, timeout: float = 20.0) -> tuple[int, bytes]:
                                                 stderr=asyncio.subprocess.DEVNULL)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
+    except BaseException:
+        await _reap(proc)
         raise
     return proc.returncode or 0, out
 
@@ -126,6 +144,7 @@ class Worker:
 
     async def start(self, verbose: bool = False) -> None:
         # The worker's own log is kept per device; the newest start goes on top of the old text.
+        rotate_log(self.log)
         log = open(self.log, "ab")
         try:
             args = [sys.executable, str(HERE / "ios_worker.py"), "--udid", self.udid, "--socket", str(self.socket),
@@ -175,9 +194,32 @@ class Worker:
             await asyncio.wait_for(self.proc.wait(), WORKER_STOP_SECS)
         except asyncio.TimeoutError:
             logger.warning("worker for %s did not stop; killing it", self.udid)
-            with contextlib.suppress(ProcessLookupError):
-                self.proc.kill()
-            await self.proc.wait()
+            await _reap(self.proc)
+        except BaseException:
+            await _reap(self.proc)
+            raise
+
+
+def rotate_log(path: Path, limit: int = LOG_ROTATE_BYTES) -> None:
+    """Move `path` to `path`.1 (replacing an older one) when it is larger than `limit` bytes."""
+    try:
+        if path.stat().st_size > limit:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+
+
+def check_bind(address: str) -> str:
+    """`address` when it is a loopback address (or "localhost"), else argparse.ArgumentTypeError."""
+    if address == "localhost":
+        return address
+    try:
+        if ipaddress.ip_address(address).is_loopback:
+            return address
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError(f"{address}: only a loopback address is allowed (127.0.0.1, ::1, localhost); "
+                                     "the preview has no login")
 
 
 class Hub:
@@ -392,9 +434,20 @@ class Hub:
         if not cmd:
             raise CommandError("empty command")
         worker = self._pick(target)
+        if cmd in INPUT_COMMANDS:
+            self._check_input(worker.udid)
         reply = await worker.request(line)
         reply.setdefault("udid", worker.udid)
         return reply
+
+    def _check_input(self, udid: str) -> None:
+        reason = config.input_lock(udid, physical=True)
+        if reason is None:
+            return
+        why = {"config": 'config: "allowInput" is not true',
+               "config unreadable": f"config: {config.CONFIG_PATH} does not load",
+               "env": "env: DEVICEDECK_LOCK_PHYSICAL_INPUT=1"}.get(reason, reason)
+        raise InputLocked(f"input to iPhone {udid} is locked ({why})", reason)
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -405,6 +458,8 @@ class Hub:
                 started = time.monotonic()
                 try:
                     reply = await self.execute(line)
+                except InputLocked as e:
+                    reply = {"ok": False, "error": str(e), "locked": e.reason}
                 except CommandError as e:
                     reply = {"ok": False, "error": str(e)}
                 except asyncio.TimeoutError:
@@ -482,7 +537,8 @@ def main() -> None:
     parser.add_argument("--socket", default=str(config.SOCKET_PATH),
                         help="command socket (env DEVICEDECK_SOCK, alias PHONED_SOCK)")
     parser.add_argument("--preview", action="store_true", help="serve the preview page")
-    parser.add_argument("--bind", default="127.0.0.1")
+    parser.add_argument("--bind", default="127.0.0.1", type=check_bind,
+                        help="preview address, loopback only (default 127.0.0.1)")
     parser.add_argument("--port", "--http-port", dest="http_port", type=int,
                         default=int(config.env("DEVICEDECK_PORT", default="7317")), help="preview port (env DEVICEDECK_PORT)")
     parser.add_argument("--panels-port", type=int, default=config.env("DEVICEDECK_PANELS_PORT"),

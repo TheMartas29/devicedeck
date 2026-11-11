@@ -5,13 +5,18 @@ Routes:
   GET  /deck.css, /deck.js     its assets
   GET  /api/devices            detected devices merged with the user's device list
   GET  /api/config             the user's device list (config.CONFIG_PATH)
-  POST /api/config             save it (JSON, same origin only); the gear panel and drag-and-drop use this
+  POST /api/config             save it (application/json only); the gear panel and drag-and-drop use this.
+                               409 while the current file does not load (it is never overwritten then)
   GET  /frame/<model>.png      bezel image from device_frame.py (<model>.mask.png: display shape)
   GET  /ios/<udid>/...         view-only viewer for one iPhone (viewer_patch.py); only the read-only
                                stream paths in viewer_patch.VIEWER_PROXY_PATHS reach the iPhone's worker
 
-Every request must name this server in Host (stops DNS rebinding), and a browser Origin, when
-sent, must be this server. Nothing here sends input to a device.
+Every request must name this server in Host (stops DNS rebinding). A browser Origin, when sent,
+must be this server; "Origin: null" (sandboxed frames, file: pages) passes only for GET and
+HEAD. POST /api/config also needs Content-Type application/json, which a cross-site page cannot
+send without a CORS preflight this server never grants. Requests without an Origin (non-browser
+local clients) are accepted. A malformed request (bad Content-Length, a request line or header
+over 64 KiB, too many headers) gets 400. Nothing here sends input to a device.
 """
 import asyncio
 import contextlib
@@ -30,6 +35,7 @@ logger = logging.getLogger("devicedeck.preview")
 
 STATIC = Path(__file__).resolve().parent / "static"
 MAX_BODY = 256 * 1024
+MAX_HEADERS = 100
 UDID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 TYPES = {".html": b"text/html; charset=utf-8", ".css": b"text/css; charset=utf-8",
          ".js": b"application/javascript; charset=utf-8"}
@@ -69,8 +75,9 @@ class Preview:
     def __init__(self, hub: Any, bind: str, port: int, panels_port: Optional[int]) -> None:
         self.hub = hub
         self.bind, self.port, self.panels_port = bind, port, panels_port
-        self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-        self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+        host = f"[{bind}]" if ":" in bind else bind
+        self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}", f"{host}:{port}".lower()}
+        self.origins = {f"http://{h}" for h in self.hosts}
         self._server: Optional[asyncio.Server] = None
         self._viewer_html = viewer_patch.html()
         self._viewer_js = viewer_patch.js()
@@ -78,7 +85,8 @@ class Preview:
 
     @property
     def url(self) -> str:
-        return f"http://{self.bind}:{self.port}/"
+        host = f"[{self.bind}]" if ":" in self.bind else self.bind
+        return f"http://{host}:{self.port}/"
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._client, self.bind, self.port)
@@ -106,19 +114,28 @@ class Preview:
             writer.close()
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        parts = (await reader.readline()).decode("latin-1").split()
-        headers: dict[str, str] = {}
-        while (line := await reader.readline()) not in (b"\r\n", b"\n", b""):
-            name, _, value = line.decode("latin-1").partition(":")
-            headers[name.strip().lower()] = value.strip()
+        try:
+            parts = (await reader.readline()).decode("latin-1").split()
+            headers: dict[str, str] = {}
+            while (line := await reader.readline()) not in (b"\r\n", b"\n", b""):
+                if len(headers) >= MAX_HEADERS:
+                    return self._reply(writer, 400, b"too many headers")
+                name, _, value = line.decode("latin-1").partition(":")
+                headers[name.strip().lower()] = value.strip()
+        except (ValueError, asyncio.LimitOverrunError):
+            return self._reply(writer, 400, b"request line or header too long")
         if len(parts) < 2:
+            if parts:
+                self._reply(writer, 400, b"bad request")
             return
         method, path = parts[0].upper(), urllib.parse.unquote(parts[1].split("?", 1)[0])
         origin = headers.get("origin")
-        if headers.get("host", "").lower() not in self.hosts or (
-                origin not in (None, "null") and origin not in self.origins):
+        if headers.get("host", "").lower() not in self.hosts or not self._origin_ok(method, origin):
             return self._reply(writer, 403, b"forbidden")
-        length = int(headers.get("content-length") or 0)
+        raw_length = headers.get("content-length") or "0"
+        if not raw_length.isascii() or not raw_length.isdigit():
+            return self._reply(writer, 400, b"bad Content-Length")
+        length = int(raw_length)
         if length > MAX_BODY:
             return self._reply(writer, 413, b"too large")
         body = await reader.readexactly(length) if length > 0 else b""
@@ -145,13 +162,25 @@ class Preview:
             return await self._ios(writer, method, path)
         return self._reply(writer, 404, b"not found")
 
+    def _origin_ok(self, method: str, origin: Optional[str]) -> bool:
+        if origin is None:
+            return True
+        if origin == "null":
+            return method in ("GET", "HEAD")
+        return origin.lower() in self.origins
+
     async def _save_config(self, writer: asyncio.StreamWriter, headers: dict[str, str], body: bytes) -> None:
         # A JSON content type makes a cross-site browser request need a CORS preflight, which
         # this server never grants.
         if headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
             return self._reply(writer, 415, b"send application/json")
+        problem = config.config_error()
+        if problem is not None:
+            return self._json(writer, 409, {"error": f"not saved: {problem}; fix or move the file by hand"})
         try:
             saved = config.save_devices(json.loads(body or b"null"))
+        except config.ConfigUnreadable as e:
+            return self._json(writer, 409, {"error": f"not saved: {e}; fix or move the file by hand"})
         except ValueError as e:
             return self._json(writer, 400, {"error": str(e)})
         except OSError as e:
