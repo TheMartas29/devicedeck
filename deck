@@ -50,7 +50,8 @@ commands:
   list                         devices: id, kind (ios|simulator|android), name, model, os, state, input
                                (hidden) = hidden in the preview only; deck still controls it
                                --json for machines
-  shot <file.png>              screenshot; prints the path and the pixel size
+  shot <file.png>              screenshot; prints the path, the pixel size and, on iOS, the
+                               point size and scale (1170x2532 px = 390x844 pt @3x)
   elements                     accessibility / UI tree as compact text
                                (centre point to tap, then [x,y wxh] frame, in tap units)
   tap <x> <y>                  points on iOS and simulators, pixels on Android
@@ -235,6 +236,7 @@ class Device:
     def launch(self, target: str) -> str: raise self.unsupported("launch")
     def apps(self, all_apps: bool) -> list[str]: raise self.unsupported("apps")
     def info(self) -> list[tuple[str, str]]: raise self.unsupported("info")
+    def point_size(self) -> tuple[float, float] | None: return None
 
 
 # ---------------------------------------------------------------- iOS (shared by physical + simulator)
@@ -818,6 +820,14 @@ class IOSDevice(Device):
             lines.append(("phoned", self.sock() or "not running (direct pymobiledevice3 fallback, slower)"))
         return lines
 
+    def point_size(self) -> tuple[float, float] | None:
+        if self.backend() == "wda":
+            return self.wda.window_size()
+        try:
+            return self.points()
+        except DeckError:
+            return None
+
     def wda_setup(self) -> str:
         return self.wda.setup()
 
@@ -932,6 +942,10 @@ class SimDevice(Device):
                 rows.append(f"{bundle}  {a.get('CFBundleDisplayName') or a.get('CFBundleName') or ''}  "
                             f"{a.get('CFBundleShortVersionString') or ''}".rstrip())
         return sorted(rows)
+
+    def point_size(self) -> tuple[float, float] | None:
+        d = ios_display(self.id)
+        return d["pt"] if d else None
 
     def info(self) -> list[tuple[str, str]]:
         lines = ios_info_lines(self, ios_display(self.id))
@@ -1166,6 +1180,14 @@ def select(devices: list[Device], selector: str | None) -> Device:
     raise DeckError(f"{selector!r} is ambiguous:\n" + table(matches), EXIT_USAGE)
 
 
+def shot_size(px: tuple[int, int], pt: tuple[float, float] | None, note: str) -> str:
+    """'1170x2532 px = 390x844 pt @3x' when the point size is known; either orientation."""
+    if not pt or not min(pt):
+        return f"{px[0]}x{px[1]} px  ({note})"
+    scale = max(px) / max(pt)
+    return f"{px[0]}x{px[1]} px = {fmt(px[0] / scale)}x{fmt(px[1] / scale)} pt @{fmt(scale)}x"
+
+
 def table(devices: list[Device]) -> str:
     rows = [("ID", "KIND", "NAME", "MODEL", "OS", "STATE", "INPUT")]
     for d in devices:
@@ -1245,7 +1267,7 @@ def main(argv: list[str]) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         note = dev.shot(path)
         size = png_size(path)
-        print(f"{path}  {size[0]}x{size[1]} px  ({note})" if size else str(path))
+        print(f"{path}  {shot_size(size, dev.point_size(), note)}" if size else str(path))
     elif cmd == "elements":
         print("\n".join(dev.elements()))
     elif cmd == "tap":

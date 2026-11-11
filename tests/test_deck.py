@@ -316,6 +316,13 @@ class WDABackend(unittest.TestCase):
             self.dev.shot(path)
             self.assertEqual(deck.png_size(path), (390, 844))
 
+    def test_cli_shot_prints_points_and_scale(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(deck.WDA, "window_size", return_value=(130.0, 281.33)):
+            code, out, err = call(["test phone", "shot", str(Path(tmp) / "s.png")], [self.dev])
+        self.assertEqual(code, 0, err)
+        self.assertIn("390x844 px = 130x281.3 pt @3x", out)
+
     def test_elements_frames_in_points(self):
         lines = self.dev.elements()
         self.assertIn('  Button "General" #com.apple.settings.general @195,406 [16,380 358x52]', lines)
@@ -447,6 +454,17 @@ class WDASetup(unittest.TestCase):
     def test_setup_only_for_ios(self):
         sim = FakeSim("SIM", "sim", "iPhone 17", "iOS 27.2", "booted")
         self.assertEqual(call(["sim", "wda-setup"], [sim])[0], 2)
+
+
+class ShotSize(unittest.TestCase):
+    def test_portrait_and_landscape(self):
+        self.assertEqual(deck.shot_size((1170, 2532), (390, 844), "n"), "1170x2532 px = 390x844 pt @3x")
+        self.assertEqual(deck.shot_size((2532, 1170), (390, 844), "n"), "2532x1170 px = 844x390 pt @3x")
+        self.assertEqual(deck.shot_size((1206, 2622), (402, 874), "n"), "1206x2622 px = 402x874 pt @3x")
+
+    def test_unknown_points_keeps_the_note(self):
+        self.assertEqual(deck.shot_size((1080, 2400), None, "tap units are these pixels"),
+                         "1080x2400 px  (tap units are these pixels)")
 
 
 class IOSState(unittest.TestCase):
